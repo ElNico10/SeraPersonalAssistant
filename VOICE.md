@@ -2,25 +2,25 @@
 
 ## One-time setup
 
-1. **Install three packages** into the Python that runs the bot (the one `discord.py` is in):
+1. **Install the voice packages** into the Python that runs the bot (the one `discord.py` is in):
 
    ```
-   python -m pip install PyNaCl davey
-   python -m pip install git+https://github.com/imayhaveborkedit/discord-ext-voice-recv
+   python -m pip install -r requirements-voice.txt
    ```
 
-   `davey` is what discord.py uses for Discord's end-to-end encryption on calls. `discord-ext-voice-recv` is what lets her
-   *listen*; discord.py can only speak into a call on its own. Whether that extension handles the encryption is not
-   confirmed, so listening is the part to watch on the first live test.
+   That is `PyNaCl`, `davey` and `discord-ext-voice-recv`. `davey` is what discord.py uses for Discord's end-to-end encryption on
+   calls. `discord-ext-voice-recv` is what lets her *listen*; discord.py can only speak into a call on its own. The handling of
+   Discord's encryption for incoming audio is in `voice_chat.py` (search for `dave`).
 
-2. **Give the bot voice permissions** in the server: **Connect** and **Speak** (and **Use Voice Activity**). The invite
-   link you made earlier didn't include them. Easiest is to give her role those permissions in Server Settings, or in the
-   voice channel's permissions.
+2. **Give the bot voice permissions** in the server: **Connect** and **Speak** (and **Use Voice Activity**). If your bot's invite
+   link didn't include them, give her role those permissions in Server Settings, or in the voice channel's permissions.
 
 3. Restart the bot.
 
-The speech models live in `voice_envs\stt` (Whisper) and `voice_envs\tts` (Chatterbox, Windows voices). They are
-already installed and don't touch the Python the bot runs in.
+4. **Create the speech environments.** The speech models run in their own Python virtual environments under `voice_envs/`, which are
+   not part of this repository and don't touch the Python the bot runs in: `stt` (faster-whisper), `tts` (Chatterbox, plus Windows
+   voices) and `tts_gpu` (Chatterbox with a CUDA build of PyTorch). Which environment and options each engine uses is set in
+   `voice_config.json`; the engines themselves are in `voice_worker.py`.
 
 ## Using it
 
@@ -28,7 +28,7 @@ Join a voice channel yourself, then in any text channel:
 
 | Command (owner only) | What it does |
 |---|---|
-| `!vc join` | She joins your voice channel and loads the speech models (about 45 s; "Voice is ready." when done) |
+| `!vc join` | She joins your voice channel and loads the speech models (about 13 s with the model files cached, about 35 s on a cold start; "Voice is ready." when done) |
 | `!vc leave` | She leaves and frees the models' memory |
 | `!vc status` | Shows the current setup |
 | `!vc voice <engine> [voice]` | Swaps the voice. Engines: `chatterbox_turbo`, `chatterbox_multilingual`, `sapi` |

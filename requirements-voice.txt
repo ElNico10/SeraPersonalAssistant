@@ -1,0 +1,5 @@
+# Extra packages for voice calls, installed into the same Python as the bot (see VOICE.md).
+# The speech models themselves run in separate environments under voice_envs/ and are not listed here.
+PyNaCl>=1.5
+davey>=0.1.7
+discord-ext-voice-recv @ git+https://github.com/imayhaveborkedit/discord-ext-voice-recv

@@ -35,5 +35,7 @@ Her language model and the picture model don't fit in the card together. A pictu
 GPU; she loads back on her next message. A picture waits while she is mid-answer. ComfyUI stops itself after 5 idle minutes.
 
 ## Models
-`image_gen/ComfyUI/models/`: `diffusion_models/Chroma1-HD-fp8_scaled_rev2.safetensors` (default), `unet/Chroma1-HD-Q6_K.gguf` (slower, kept as a
-fallback), `clip/t5xxl_fp8_e4m3fn.safetensors`, `vae/chroma_vae.safetensors`. Change `models.unet` in the config to switch.
+The picture model is chosen in `~/.sera/models.json`, under `"image"`: `unet`, `clip` and `vae` are file names inside
+`image_gen/ComfyUI/models/` (`diffusion_models` or `unet`, `clip`, `vae`). The author uses `Chroma1-HD-fp8_scaled_rev2.safetensors`, `t5xxl_fp8_e4m3fn.safetensors`
+and `chroma_vae.safetensors`, and keeps a slower `Chroma1-HD-Q6_K.gguf` build as a fallback. With no `image` entry in `models.json`, pictures stay off.
+`image_gen.py` builds its ComfyUI workflow for Chroma-style models, so a very different picture model would need that function adapted.

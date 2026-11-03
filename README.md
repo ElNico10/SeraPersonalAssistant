@@ -1,12 +1,13 @@
 # Sera
 
 A local Discord bot with a personality, memory, mood, voice-call support, image generation and coding agents. Her brain is a local
-model run through Ollama; nothing she says is sent to a hosted API. The one optional exception is the owner-only Claude coding agent,
-which uses the Claude Code CLI and your own Claude plan.
+model run through Ollama, so what people say to her is not sent to a hosted AI service. The one optional exception is the owner-only
+Claude coding agent, which sends its coding task to Anthropic through the Claude Code CLI and your own Claude plan. (Discord itself, of
+course, sees the chat.)
 
 > Built for one owner on one Windows PC (RTX 5070, 12 GB). Nothing that makes her *someone* is in this repo: her persona, canned
-> replies, keys and web token live in `~/.sera/` (your user folder), and her workspace is `~/Documents/SeraWorkspace`
-> (or the folder named by the `SERA_WORKSPACE` environment variable). She will not start without her own persona.
+> replies, model choices, keys and web token live in `~/.sera/` (your user folder), and her workspace is `~/Documents/SeraWorkspace`
+> (or the folder named by the `SERA_WORKSPACE` environment variable). Without a persona file she runs on a polite default.
 
 ## Models
 
@@ -76,18 +77,18 @@ prompts were short, so real replies with her full prompt take longer. Voice and 
   model and effort. Sessions stay open between jobs and are cleared with `/clear`; transcripts go to `.history/`. Resets on restart.
 - **Pictures:** see `IMAGES.md`.
 - **Pings:** `@Name` in her replies becomes a real mention only for an exact Discord name, never a nickname.
-- **Web page:** a small local page on port 8765, protected by the token in `web_token.txt`.
+- **Web page:** a small local page on port 8765, protected by the token in `~/.sera/web_token.txt`.
 
 ## Commands
 
-`!help` lists them. Owner-only: `!agent`, `!vc`.
+`!help` lists them. Owner-only: `!agent`, `!mood`, `!vc`.
 
 ## Setup
 
-1. Install [Ollama](https://ollama.com) and pull the models above.
+1. Install [Ollama](https://ollama.com) and pull the models you choose (`ollama pull <name>`).
 2. Install Docker Desktop and build the sandbox: `docker build -t sera-sandbox sandbox/`.
-3. Python 3.11 with `discord.py` and `ollama`. The voice workers use their own environments under `voice_envs/`.
-4. Create the folder `~/.sera/` (on Windows, `C:\Users\<you>\.sera`) and put three things in it. None of them belong in git:
+3. Python 3.11: `pip install -r requirements.txt` (and `pip install -r requirements-voice.txt` for voice calls).
+4. Create the folder `~/.sera/` (on Windows, `C:\Users\<you>\.sera`) and put these files in it. None of them belong in git:
    - `sera.env` with your Discord bot token (`DISCORD_TOKEN`) and `SERA_OWNER_ID` (your Discord user id);
    - `models.json`, which models she runs (required: at least `chat`). Only `chat` is needed to start; each other entry turns a
      feature on. For example (use your own model names):
@@ -113,14 +114,21 @@ prompts were short, so real replies with her full prompt take longer. Voice and 
    uncensored, why, and what limits her.
 
    The web page's token (`web_token.txt`) is created in the same folder the first time she runs.
-5. For Claude mode, install the Claude Code CLI and sign in with your plan.
-6. `python discord_bot.py`
+5. Optional extras that are **not in this repository** (they are large, and ignored by git). Each feature stays off without its part:
+   - **Pictures:** ComfyUI installed in `image_gen/ComfyUI` with its own virtual environment at `image_gen/venv`, and the model files
+     named in `models.json` placed under `image_gen/ComfyUI/models/`. See `IMAGES.md`.
+   - **Voice models:** separate Python virtual environments in `voice_envs/stt` (faster-whisper), `voice_envs/tts` and
+     `voice_envs/tts_gpu` (Chatterbox; the GPU one with a CUDA build of PyTorch). Their paths are set in `voice_config.json`. See `VOICE.md`.
+6. For Claude mode, install the Claude Code CLI and sign in with your plan.
+7. `python discord_bot.py`
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `discord_bot.py` | the bot: chat, triage, tools, agents, commands |
+| `sera_home.py` | reads her private files from `~/.sera` (persona, canned replies, models), with safe defaults |
+| `console_guard.py` | keeps a paused Windows console from freezing the bot |
 | `notebook.py` | notebook and efficiency settings |
 | `claude_sessions.py` | kept-open Claude CLI sessions |
 | `agent_sandbox.py`, `sandbox_mcp.py`, `sandbox/` | Docker sandbox and its tool server |
@@ -135,4 +143,7 @@ prompts were short, so real replies with her full prompt take longer. Voice and 
 - Discord bots cannot run slash commands, so she cannot use another bot's slash commands.
 - Whether another bot accepts commands that a bot typed is up to that bot.
 - The sandbox has no network, so `pip` and `npm install` do not work in it.
-- Load time and VRAM use of the voice stack have not been measured.
+- The voice timings above were measured with the workers on their own, not during a live Discord call; picture speed and quality were
+  not benchmarked.
+- Only the author's setup (Windows 11, RTX 5070) has been run end to end. Linux and macOS are untested.
+- The offline test suites are not part of this repository.
