@@ -1,0 +1,99 @@
+{
+  "_help": "Edit this file while the bot runs: it is re-read for every utterance. To swap the voice, change tts.engine (or use '!vc voice <engine>' in chat). To swap speech recognition, change stt.engine or the model under engines.faster_whisper.options. 'python' paths are relative to this folder.",
+  "stt": {
+    "engine": "faster_whisper",
+    "language": "auto",
+    "extra_hints": [
+      "Sera",
+      "Seraphim",
+      "Discord"
+    ]
+  },
+  "tts": {
+    "engine": "chatterbox_turbo_gpu",
+    "non_english_engine": "chatterbox_multilingual",
+    "voice": "",
+    "params": {
+      "temperature": 0.7
+    }
+  },
+  "engines": {
+    "faster_whisper": {
+      "python": "voice_envs/stt/Scripts/python.exe",
+      "options": {
+        "model": "small",
+        "device": "cpu",
+        "cpu_threads": 4
+      }
+    },
+    "sapi": {
+      "python": "voice_envs/tts/Scripts/python.exe",
+      "options": {}
+    },
+    "chatterbox_turbo": {
+      "python": "voice_envs/tts/Scripts/python.exe",
+      "options": {
+        "device": "cpu"
+      }
+    },
+    "chatterbox_multilingual": {
+      "python": "voice_envs/tts/Scripts/python.exe",
+      "options": {
+        "device": "cpu"
+      }
+    },
+    "chatterbox_turbo_gpu": {
+      "engine": "chatterbox_turbo",
+      "python": "voice_envs/tts_gpu/Scripts/python.exe",
+      "options": {
+        "device": "cuda",
+        "precision": "mixed"
+      }
+    }
+  },
+  "listen": {
+    "respond_to": "name_or_session",
+    "session_seconds": 45,
+    "silence_seconds": 0.9,
+    "min_seconds": 0.5,
+    "min_rms": 0.008,
+    "max_utterance_seconds": 30,
+    "barge_in": true,
+    "echo_to_text": false,
+    "hear_bots": [],
+    "bot_reply_limit": 3,
+    "batch": {
+      "max_seconds": 25,
+      "max_clips": 8,
+      "gap_seconds": 1.0,
+      "wait_seconds": 0.3,
+      "max_age_seconds": 45,
+      "merge_wait_seconds": 2.0
+    },
+    "keep_overheard": true,
+    "check_follow_ups": true,
+    "barge_in_from": "addressed",
+    "barge_in_frames": 15,
+    "busy_humans": 3,
+    "session_seconds_busy": 12
+  },
+  "speak": {
+    "max_tokens": 110,
+    "temperature": 0.7,
+    "max_sentences": 4,
+    "max_chars": 320,
+    "lookahead_chunks": 2,
+    "sentence_pause_ms": 220,
+    "clause_pause_ms": 40,
+    "min_chunk_chars": 12,
+    "max_sentences_busy": 2,
+    "thinking_sound": true,
+    "thinking_sound_delay": 0.5,
+    "thinking_sound_period": 1.6,
+    "thinking_sound_volume": 0.1
+  },
+  "call": {
+    "sera_gpu_layers": 44,
+    "_help": "While she is in a call, this many of her model's layers stay on the GPU (the rest run on the CPU) so the voice fits beside it. null = all of them."
+  }
+}

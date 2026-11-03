@@ -1,0 +1,8 @@
+{
+  "claude_max_attempts": 2,
+  "persistent_sessions": true,
+  "session_max_jobs": 30,
+  "session_max_context": 40000,
+  "save_transcripts": true,
+  "history_keep": 50
+}

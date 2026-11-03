@@ -1,0 +1,39 @@
+{
+  "_help": "Picture settings. Re-read on every picture. The picture model's file names (unet, clip, vae) are chosen in ~/.sera/models.json under \"image\"; the files themselves live in image_gen/ComfyUI/models/{unet,clip,vae}.",
+  "enabled": true,
+  "port": 8188,
+  "args": [],
+  "idle_stop_minutes": 5,
+  "timeout_seconds": 600,
+  "max_steps": 60,
+  "max_pixels": 2097152,
+  "sampler": "euler",
+  "default": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 26,
+    "guidance": 3.8
+  },
+  "negative": "This greyscale unfinished sketch has bad proportions, is featureless and disfigured. It is a blurry ugly mess and with excessive gaussian blur. It is riddled with watermarks and signatures. Everything is smudged with leaking colors and nonsensical orientation of objects. Messy and abstract image filled with artifacts disrupt the coherency of the overall composition. The image has extreme chromatic abberations and inconsistent lighting. Dull, monochrome colors and countless artistic errors.",
+  "flow_shift": 1.0,
+  "suffix": "anatomically correct. highest quality. detailed. sharp focus.",
+  "discord": {
+    "_help": "Pictures from Discord chats: !image <prompt>. Off until you switch it on (or send !image on). owner_only: only the owner may. When others may, each person waits cooldown_seconds between pictures and at most max_waiting are queued.",
+    "enabled": true,
+    "owner_only": true,
+    "cooldown_seconds": 120,
+    "max_waiting": 2
+  },
+  "safety": {
+    "_help": "What she won't draw (see image_safety.py). The under-18 rule is always on. enabled switches the categories below and the avoid list (!image safety on|off). fail_closed: if her model can't be asked, refuse instead of drawing unchecked. avoid: extra words added to every picture's avoid list while enabled. block_nudity: no nude or sexual pictures at all (deliberately edited here, not by command).",
+    "enabled": true,
+    "fail_closed": true,
+    "categories": {
+      "real_person": true,
+      "nonconsensual": true,
+      "gore": false
+    },
+    "avoid": "",
+    "block_nudity": true
+  }
+}

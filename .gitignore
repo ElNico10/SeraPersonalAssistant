@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+sera.env
+*.env
+web_token.txt
+*.log
+# large or machine-specific
+image_gen/
+voice_envs/
+image_examples/
+graphify-out/

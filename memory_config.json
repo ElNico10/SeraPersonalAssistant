@@ -1,0 +1,9 @@
+{
+  "_help": "Edit while the bot runs. The memories themselves live in SeraWorkspace\\memories.md, which you can read and edit by hand.",
+  "enabled": true,
+
+  "recall": {"max_memories": 6, "max_chars": 1800, "pinned_chars": 700, "important_fallback": 2},
+  "extract": {"enabled": true, "after_messages": 8, "idle_minutes": 10, "max_per_run": 5, "slice_chars": 4000},
+  "store": {"max_entries": 300, "max_chars_each": 220},
+  "history": {"enabled": true, "keep_messages": 20, "max_age_hours": 24}
+}

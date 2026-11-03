@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sera</title>
+<style>
+  :root {
+    --bg: #0e1013; --panel: #14171c; --line: #242932; --text: #d9dde4; --dim: #7d8794; --accent: #f0a35e; --you: #7fb4ff; --warn: #ff6b6b; --ok: #6bd49a;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f5f3ef; --panel: #ffffff; --line: #dcd7cf; --text: #23262b; --dim: #6b7280; --accent: #b4580f; --you: #1d5fc4; --warn: #c0392b; --ok: #1f8a54; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 var(--mono); }
+  #app { display: grid; grid-template-columns: 170px 1fr; grid-template-rows: 40px 1fr; height: 100%; }
+  header { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; padding: 0 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header b { color: var(--accent); letter-spacing: .08em; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: var(--warn); }
+  #dot.on { background: var(--ok); }
+  #state { color: var(--dim); font-size: 12px; }
+  nav { border-right: 1px solid var(--line); background: var(--panel); padding: 10px 0; overflow-y: auto; }
+  nav button { display: block; width: 100%; text-align: left; padding: 8px 16px; background: none; border: 0; border-left: 3px solid transparent;
+               color: var(--dim); font: inherit; cursor: pointer; }
+  nav button:hover { color: var(--text); }
+  nav button.active { color: var(--text); border-left-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  main { position: relative; min-width: 0; min-height: 0; }
+  section.panel { position: absolute; inset: 0; display: none; overflow: auto; }
+  section.panel.active { display: flex; flex-direction: column; }
+  @media (max-width: 640px) {
+    #app { grid-template-columns: 1fr; grid-template-rows: 40px 40px 1fr; }
+    nav { display: flex; border-right: 0; border-bottom: 1px solid var(--line); padding: 0; overflow-x: auto; }
+    nav button { width: auto; white-space: nowrap; border-left: 0; border-bottom: 3px solid transparent; padding: 8px 14px; }
+    nav button.active { border-bottom-color: var(--accent); }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header><b>SERA</b><span id="dot"></span><span id="state">connecting…</span></header>
+  <nav id="nav"></nav>
+  <main id="main"></main>
+</div>
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const listeners = [];
+let ws, ref = 0, retry = 1000, owner = "you";
+const waiting = new Map();
+const mounted = new Set();
+let panelList = [];
+
+// What a panel is given: call() asks its python side, onEvent() hears everything the server pushes, say() talks to her.
+const api = (pid) => ({
+  owner: () => owner,
+  say: (text) => ws && ws.readyState === 1 && ws.send(JSON.stringify({ type: "say", text })),
+  call: (data) => new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== 1) return reject(new Error("not connected"));
+    const r = ++ref;
+    waiting.set(r, { resolve, reject });
+    ws.send(JSON.stringify({ type: "panel", panel: pid, ref: r, data }));
+  }),
+  onEvent: (fn) => listeners.push(fn),
+});
+
+async function mount(p) {
+  if (mounted.has(p.id)) return;
+  mounted.add(p.id);
+  const el = document.querySelector(`#panel-${p.id}`);
+  try {
+    const mod = await import(`/panels/${p.id}.js?v=${Date.now()}`);
+    await mod.mount(el, api(p.id));
+  } catch (e) {
+    el.innerHTML = `<pre style="color:var(--warn);padding:16px;white-space:pre-wrap">This panel failed to load:\n${String(e)}</pre>`;
+  }
+}
+
+function show(id) {
+  document.querySelectorAll("section.panel").forEach((s) => s.classList.toggle("active", s.id === `panel-${id}`));
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.id === id));
+  try { localStorage.setItem("sera-panel", id); } catch {}
+  const p = panelList.find((x) => x.id === id);
+  if (p) mount(p);
+  window.dispatchEvent(new CustomEvent("panel-shown", { detail: id }));
+}
+
+function setPanels(list) {
+  if (JSON.stringify(list) === JSON.stringify(panelList)) return;
+  panelList = list;
+  $("nav").innerHTML = ""; $("main").innerHTML = "";
+  for (const p of list) {
+    const b = document.createElement("button");
+    b.textContent = p.title; b.dataset.id = p.id; b.onclick = () => show(p.id);
+    $("nav").append(b);
+    const s = document.createElement("section");
+    s.className = "panel"; s.id = `panel-${p.id}`;
+    $("main").append(s);
+  }
+  mounted.clear();
+  mount(list[0]);  // chat is always running, so nothing she says is missed while another panel is open
+  let last = "chat"; try { last = localStorage.getItem("sera-panel") || "chat"; } catch {}
+  show(list.some((p) => p.id === last) ? last : list[0].id);
+}
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { $("dot").classList.add("on"); $("state").textContent = "connected"; retry = 1000; };
+  ws.onclose = () => {
+    $("dot").classList.remove("on"); $("state").textContent = "disconnected, retrying…";
+    setTimeout(connect, retry); retry = Math.min(retry * 2, 8000);
+  };
+  ws.onmessage = (m) => {
+    const ev = JSON.parse(m.data);
+    if (ev.type === "hello") { owner = ev.owner; setPanels(ev.panels); }
+    if (ev.type === "panel" && ev.ref && waiting.has(ev.ref)) {
+      const w = waiting.get(ev.ref); waiting.delete(ev.ref);
+      ev.error ? w.reject(new Error(ev.error)) : w.resolve(ev.data);
+      return;
+    }
+    listeners.forEach((fn) => { try { fn(ev); } catch (e) { console.error(e); } });
+  };
+}
+connect();
+</script>
+</body>
+</html>

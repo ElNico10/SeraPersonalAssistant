@@ -1,0 +1,51 @@
+{
+  "_help": "Edit while the bot runs: re-read whenever the file changes. Everything about how fast her feelings move is here.",
+  "enabled": true,
+  "baseline": {
+    "valence": 0.1,
+    "energy": 0.5,
+    "patience": 0.7
+  },
+  "half_life_minutes": {
+    "mood": 45,
+    "annoyance": 20
+  },
+  "opinion_half_life_days": 14,
+  "mood_rate": 0.35,
+  "opinion_rate": 0.15,
+  "max_step": {
+    "mood": 0.3,
+    "opinion": 0.3,
+    "patience": 0.3
+  },
+  "presence": {
+    "away_minutes": 15,
+    "strength": 0.15
+  },
+  "ignore": {
+    "owner_exempt": true,
+    "default_minutes": 10,
+    "max_minutes": 120
+  },
+  "auto_ignore": {
+    "enabled": true,
+    "annoyance": 0.9,
+    "minutes": 5
+  },
+  "favor": {
+    "likes": 0.4,
+    "dislikes": -0.3,
+    "cant_stand": -0.6
+  },
+  "appraise": {
+    "enabled": true,
+    "min_words": 3,
+    "max_per_minute": 8
+  },
+  "voice_join_nudge": true,
+  "tolerance": {
+    "_help": "How much of the bad in someone's messages she shrugs off (0 = all of it counts, 1 = none). Per person: !mood tolerance <name> <0-1|default>",
+    "default": 0.0,
+    "owner": 0.8
+  }
+}

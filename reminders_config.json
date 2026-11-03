@@ -1,0 +1,14 @@
+{
+  "_help": "Edit while the bot runs. Reminders are only for the next few days; times are read in this PC's timezone.",
+  "enabled": true,
+
+  "max_days": 7,
+  "min_seconds": 30,
+  "poll_seconds": 15,
+
+  "limits": {"pending_per_person": 10, "pending_total": 60, "set_per_hour_non_owner": 8},
+  "delivery": {"max_tries": 6, "retry_seconds": 30, "late_note_after_seconds": 120, "speak_in_call": true},
+  "keep_finished_days": 3,
+
+  "defaults": {"morning": "09:00", "afternoon": "15:00", "evening": "18:00", "tonight": "20:00", "night": "21:00", "no_time": "09:00"}
+}
