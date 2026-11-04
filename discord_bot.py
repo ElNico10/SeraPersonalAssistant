@@ -19,6 +19,7 @@ import console_guard
 import voice_chat
 import mood
 import memory
+import message_log
 import notebook
 import sera_home
 import claude_sessions
@@ -213,7 +214,7 @@ delegate_task_tool = {
     'type': 'function',
     'function': {
         'name': 'delegate_task',
-        'description': 'Hands a coding job to a coding agent that runs in the background (writing, editing or debugging code and scripts). Returns immediately; the result is posted when it finishes. The agent has no memory of this chat, so the task must be complete and self-contained.',
+        'description': 'Hands a coding job to a coding agent that runs in the background (writing, editing or debugging code and scripts). Returns immediately; the result is posted when it finishes. The agent has no memory of this chat, so the task must be complete and self-contained. The agent CAN SEE IMAGES: any pictures the user attached to their message are given to it automatically, so say what to do with them (describe, read the text in, copy the layout, find the bug in the screenshot) and never refuse an image yourself.',
         'parameters': {
             'type': 'object',
             'properties': {'task': {'type': 'string', 'description': 'Full, self-contained instructions for the agent.'},
@@ -425,6 +426,10 @@ AGENT_MAX_TOKENS = 12000  # ollama backend only: per call, thinking included; af
 # A thinking call that hits its cap is wasted time: in the long job 3 of 8 did, about 155s each (12000 tokens), and the
 # agent then carried on from its notes anyway. A smaller cap for thinking calls cuts that; the cutoff handling is unchanged.
 AGENT_THINK_TOKENS = 6000
+PLAN_TOKENS = 3000   # thinking and plan together: more than this and the planner is going round in circles
+MEDIC_TOKENS = 1500  # same for the recovery step after a failed tool
+# Tools whose ❌ is an answer, not a mistake to fix (nothing found, not allowed, no room, stopped): the recovery step can only make things worse there
+NO_MEDIC = ('look_back', 'look_at_agent_work', 'fetch_old_image', 'search_chat_history', 'delegate_task', 'cancel_job', 'generate_image', 'check_jobs')
 QUESTION_ANSWER_CHARS = 3000  # how much of a question's answer Sera reads to introduce it; the user gets all of it
 MAX_ATTEMPTS = 3          # total agent runs per job; Sera sends it back when her review fails it
 
@@ -557,10 +562,14 @@ async def _finish(job_id):
     """After the agent: Sera reviews the files, sends the job back if it misses the task, else reports in her voice."""
     job = jobs[job_id]
     channel = find_channel(job['channel_id'])
+    if job.get('cancelled'):
+        return ''
     async with MODEL_LOCK:
         verdict, overridden = {}, False
         if job['status'] == 'done':
             verdict = await asyncio.to_thread(_judge, job)
+            if job.get('cancelled'):  # told to give up while she was reviewing it
+                return ''
             print(f"🔍 Job #{job_id} review: {verdict['verdict']} | {verdict['feedback'][:300]!r}")
             _job_log(job, f"REVIEW (Sera): {verdict}\n")
             if verdict['verdict'] == 'pass' and job.get('after_failing') and job.get('edited'):
@@ -783,13 +792,15 @@ def _agent_ollama(prompt, log=None, protected=None, model=None):
                  "changed and why, and every feature or kind of invalid input your tests did NOT cover. Never write that "
                  "there are no bugs unless your tests cover every feature and every kind of invalid input. "
                  "Once your tests pass, stop and give your summary; do not run extra edge cases to be thorough."},
-                {'role': 'user', 'content': prompt}]
+                {'role': 'user', 'content': prompt, **({'images': agent_ctx.images} if getattr(agent_ctx, 'images', None) else {})}]
     seen = set()
     runs = 0
     edited = False
     asked_for_limits = False
     thinking_on = True
     for round_no in range(AGENT_MAX_ROUNDS):
+        if getattr(agent_ctx, 'cancel', None) and agent_ctx.cancel():
+            raise RuntimeError("cancelled")
         if round_no == AGENT_MAX_ROUNDS - 4:  # don't let a job die at the limit with its work done but unreported
             messages.append({'role': 'user', 'content': "You are nearly out of rounds. Stop testing and give your summary now."})
         late = round_no >= AGENT_MAX_ROUNDS - 3  # the model ignores "stop", so the last rounds refuse tool calls
@@ -883,8 +894,12 @@ def _report_error(job_id, fut):
 def _run_job(job_id):
     job = jobs[job_id]
     with agent_lock:
+        if job.get('cancelled'):
+            job['status'] = 'cancelled'
+            return
         job['status'] = 'running'
         job['attempts'] += 1
+        agent_ctx.cancel = lambda: job.get('cancelled')
         started = time.monotonic()
         if not job['feedback']:
             retry = ''
@@ -903,6 +918,14 @@ def _run_job(job_id):
             if smoke:
                 print(f"🧪 {smoke}")
                 prompt += f"\n\n{smoke}"
+            images = job.get('images') or []
+            if images and job.get('backend', AGENT_BACKEND) == 'claude':  # Claude opens the saved file with its Read tool
+                prompt += ("\n\nThe user attached " + ("pictures" if len(images) > 1 else "a picture") + " to their message, saved in your folder as: "
+                           + ", ".join(images) + ". Look at " + ("them" if len(images) > 1 else "it") + " (the Read tool shows images) as part of the task.")
+            elif images:  # the local model is handed the picture in its first message; its file tools can't open images, and trying wastes rounds
+                prompt += ("\n\nThe user attached " + ("pictures" if len(images) > 1 else "a picture") + " to this message. " + ("They are" if len(images) > 1 else "It is")
+                           + " already shown to you here: look at " + ("them" if len(images) > 1 else "it") + " directly and do not try to open it with the file tools.")
+            agent_ctx.images = [os.path.join(AGENT_DIR, i) for i in images]
             backend = job.get('backend', AGENT_BACKEND)
             tier = job.get('tier')
             effort_note = f", effort {job['effort']}" if job.get('effort') else ''
@@ -932,12 +955,14 @@ def _run_job(job_id):
             _job_log(job, f"CHECK AFTER THE AGENT FINISHED:\n{job['after_check']}\nNot clean: {', '.join(failing) or 'none'}\n")
         except Exception as e:
             job['status'], job['result'] = 'failed', str(e)
+    if job.get('cancelled'):
+        job['status'] = 'cancelled'
     _job_log(job, f"=== Attempt {job['attempts']} ended: {job['status']} | {time.monotonic() - started:.0f}s | changed files: "
                   f"{', '.join(job.get('changed') or []) or 'none'}\nRESULT:\n{job['result']}\n")
     answered = getattr(agent_ctx, 'served', None)
     answered_note = f" (answered by {', '.join(answered)})" if answered else ''
     print(f"🛠️ Job #{job_id} attempt {job['attempts']}: {job['status']}{answered_note} | {job['result'][:200]!r}")
-    if LOOP:
+    if LOOP and not job.get('cancelled'):  # a job she was told to give up on is not reviewed, retried or reported
         fut = asyncio.run_coroutine_threadsafe(_finish(job_id), LOOP)
         fut.add_done_callback(lambda f: _report_error(job_id, f))
 
@@ -964,10 +989,46 @@ def delegation_blocker():
         return not_owner_line()
     return None
 
+async def _wait_for_reply():
+    async with MODEL_LOCK:  # held while she answers: it frees when her reply, and what she does after it, is finished
+        pass
+
+def _run_job_after_reply(job_id):
+    """Start the job once her own model is done with this message. The coding model and her chat model can't both sit on the GPU, so a job
+    that starts mid-reply makes the two evict each other, and every swap costs a reload (measured: a 154 s job for a 15 s piece of work)."""
+    if LOOP:
+        try:
+            asyncio.run_coroutine_threadsafe(_wait_for_reply(), LOOP).result(timeout=300)
+        except Exception as e:
+            print(f"⚠️ job #{job_id} didn't wait for her reply: {e}")
+    _run_job(job_id)
+
+FETCHED_MINUTES = 30
+fetched_images = {}  # channel id -> (picture paths, when): pictures she fetched from the history, still wanted if the job comes in a later message
+PICTURE_WORDS = re.compile(r"image|picture|photo|screenshot|\bpic\b|\.(png|jpe?g|webp)\b", re.I)
+
+def fetched_for(task):
+    """The pictures she fetched here lately, if this task is about a picture and they are still on disk."""
+    paths, when = fetched_images.get(current['channel_id'], ([], 0))
+    if time.time() - when > FETCHED_MINUTES * 60 or not PICTURE_WORDS.search(task or ''):
+        return []
+    return [p for p in paths if os.path.isfile(os.path.join(AGENT_DIR, p))]
+
+def named_in_task(task):
+    """Saved pictures whose file name the task itself mentions (with or without the message-number prefix): she often just names the file."""
+    try:
+        files = [f for f in os.listdir(os.path.join(AGENT_DIR, 'images')) if f.lower().endswith(IMAGE_EXTS)]
+    except OSError:
+        return []
+    low = (task or '').lower()
+    return [f"images/{f}" for f in files if f.lower() in low or f.lower().split('-', 1)[-1] in low]
+
 def delegate_task(task, difficulty=''):
     blocked = delegation_blocker()
     if blocked:
         return f"❌ {blocked}"
+    if current.get('image_missing') and not current.get('images'):  # she went looking for a picture and didn't find it: no job about it
+        return "❌ The picture you were asked to look at wasn't found, so there is nothing to hand over. Tell them it couldn't be found; start no job."
     if agent_mode['claude'] and is_owner(current['user_id']):
         if not agent_cfg()['claude_models']:
             return "❌ Claude mode is on but no Claude models are set (models.json, see the README)."
@@ -978,7 +1039,7 @@ def delegate_task(task, difficulty=''):
         if not fits:
             return f"❌ {why}"
     job_id = len(jobs) + 1
-    jobs[job_id] = {'task': task, 'status': 'queued', 'result': '', 'channel_id': current['channel_id'],
+    jobs[job_id] = {'images': list(dict.fromkeys(list(current.get('images') or []) + fetched_for(task) + named_in_task(task))), 'task': task, 'status': 'queued', 'result': '', 'channel_id': current['channel_id'],
                     'attempts': 0, 'feedback': '', 'user_id': current['user_id'], 'message_id': current['message_id'],
                     'log': os.path.join(JOB_LOG_DIR, f"job-{job_id}-{time.strftime('%Y%m%d-%H%M%S')}.txt")}
     on = ''
@@ -987,7 +1048,7 @@ def delegate_task(task, difficulty=''):
         effort = claude_effort()
         jobs[job_id].update(backend='claude', model=model, tier=tier, effort=effort, max_attempts=agent_cfg()['claude_max_attempts'])
         on = f" on Claude {tier}" + (f" at {effort} effort" if effort else "")
-    threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
+    threading.Thread(target=_run_job_after_reply, args=(job_id,), daemon=True).start()
     return f"🛠️ Job #{job_id} started{on}. It will be reported here when it finishes."
 
 IMAGES_DIR = os.path.join(SECURE_BOT_DIRECTORY, 'images')
@@ -1039,6 +1100,44 @@ def web_status():
     """What the page's Status panel shows: her feelings, memory, reminders and jobs, in words."""
     return {'mood': mood.status_text(), 'memory': memory.stats_text(), 'reminders': reminders.status_text(),
             'jobs': check_jobs(), 'safety': image_safety.status_text(), 'model': f"{MODEL_NAME}\nkeep-alive {KEEP_ALIVE}, GPU layers {GPU_LAYERS if GPU_LAYERS is not None else 'all'}"}
+
+def cancel_job(job_id=''):
+    """Owner only. Give up on a job: it is not retried, reviewed or reported. A local agent stops at its next round; a Claude session is ended.
+    No number means every job that is waiting or running."""
+    if not is_owner(current['user_id']):
+        return "❌ " + not_owner_line()
+    return _cancel_jobs(job_id)
+
+def _cancel_jobs(job_id=''):
+    text = str(job_id or '').strip().lstrip('#')
+    if text and not text.isdigit():
+        return "❌ That isn't a job number."
+    ids = [int(text)] if text else [i for i, j in jobs.items() if j['status'] in ('queued', 'running')]
+    stopped = []
+    for i in ids:
+        job = jobs.get(i)
+        if not job or job['status'] not in ('queued', 'running'):
+            continue
+        job['cancelled'] = True
+        if job['status'] == 'running' and job.get('backend') == 'claude':
+            effort = job.get('effort')
+            claude_sessions.pool.kill(f"{job['model']}@{effort}" if effort else job.get('model'))
+        job['status'] = 'cancelled'
+        _job_log(job, "=== Cancelled by the owner ===\n")
+        stopped.append(i)
+    if not stopped:
+        return f"There is no waiting or running job #{text}." if text else "There is no job running or waiting."
+    return "🛑 Gave up on job" + ("s " if len(stopped) > 1 else " ") + ", ".join(f"#{i}" for i in stopped) + ". It won't be retried or reported. Tell them it's stopped."
+
+cancel_job_tool = {
+    'type': 'function',
+    'function': {
+        'name': 'cancel_job',
+        'description': 'Give up on a coding job when your owner says to stop, cancel or give up on it. Give its number, or leave it empty to stop '
+                       'every job that is waiting or running. A cancelled job is not retried or reported. Do not start the job again on your own.',
+        'parameters': {'type': 'object', 'properties': {'job_id': {'type': 'string'}}}
+    }
+}
 
 def check_jobs():
     if not jobs:
@@ -1274,7 +1373,7 @@ def _recent_user_text(channel_id, n=3):
                 break
     return ' '.join(texts)
 
-def refresh_notes(channel_id):
+def refresh_notes(channel_id, related=''):
     """Put what she remembers about the people here into her history as one data message after the system prompt.
     It is never part of the system prompt, so nothing anyone says to her can reach her instructions through it."""
     hist = chat_histories[channel_id]
@@ -1288,6 +1387,7 @@ def refresh_notes(channel_id):
                          f"Reminders you are holding (the exact wording and time; never change them):\n{due_soon}" if due_soon else '',
                          f"How you feel:\n{feelings}" if feelings else '',
                          f"What you remember from earlier chats:\n{earlier}" if earlier else '',
+                         f"Older messages from this server that may be what they mean (search_chat_history finds more):\n{related}" if related else '',
                          f"What you know about them:\n{block}" if block else '') if t]
     if parts:  # just before the newest message, not at the top: the older history then starts the same every time and can be reused
         at = next((i for i in range(len(hist) - 1, 0, -1) if isinstance(hist[i], dict) and hist[i].get('role') == 'user'), 1)
@@ -1365,6 +1465,153 @@ recall_tool = {
 
 def look_back(entry=0, offset=0):
     return notebook.look_back(current['channel_id'], entry, offset)
+
+search_history_tool = {
+    'type': 'function',
+    'function': {
+        'name': 'search_chat_history',
+        'description': 'Look up old messages said in this server (what someone said, when, where). Use it whenever someone talks as if you should remember something and your notes do not cover it. Give the words to look for: a message that '
+                       'contains ANY of them is found, so list several ("regex", "parser"). Optionally a person (a name, or "me"), and how '
+                       'far back: days_back, or since / until as YYYY-MM-DD. With no range it only looks back a day or two; ask for more '
+                       'days when the person says it was longer ago ("a few days ago" is about 4, "last week" 7, "last month" 30).',
+        'parameters': {'type': 'object', 'properties': {
+            'words': {'type': 'array', 'items': {'type': 'string'}}, 'person': {'type': 'string'}, 'days_back': {'type': 'number'},
+            'since': {'type': 'string'}, 'until': {'type': 'string'},
+            'server': {'type': 'string', 'description': 'Only works for your owner: the name of another server to search.'}},
+            'required': ['words']}
+    }
+}
+
+def readable_channels(guild, asker, owner):
+    """Which channels a history search may cover: all of them for the owner, otherwise only those the asker can read themselves.
+    If that can't be worked out, none."""
+    if owner:
+        return None
+    if not guild or asker is None or not hasattr(asker, 'guild_permissions'):
+        return []
+    return [c.id for c in list(guild.channels) + list(guild.threads)
+            if c.permissions_for(asker).view_channel and c.permissions_for(asker).read_message_history]
+
+def auto_history(message):
+    """Old messages that bear on what is being said, when it sounds like she is expected to remember. No model call: a word list decides.
+    Same rules as the search tool (this server, channels the speaker can read)."""
+    if message.guild is None or getattr(message, 'is_web', False):
+        return ''
+    q = message_log.auto_query(message.clean_content)
+    if not q:
+        return ''
+    words, days = q
+    rows, since_text = message_log.search(message.guild.id, words, None, days, None, None,
+                                          readable_channels(message.guild, message.author, is_owner(message.author.id)), exclude_id=message.id)
+    return message_log.render(rows, since_text, message.guild.name) if rows else ''
+
+fetch_image_tool = {
+    'type': 'function',
+    'function': {
+        'name': 'fetch_old_image',
+        'description': 'Get a picture posted earlier so your coding agent can look at it. Say which one with a message number (from '
+                       'search_chat_history, a message with [image: name] in it), or the picture\'s file name. If they just say "the image I '
+                       'sent earlier", leave it empty and you get the most recent one. Never invent a number. It checks the picture is really '
+                       'there. Only call delegate_task afterwards if this says it was found; if it says it was not, tell them and stop.',
+        'parameters': {'type': 'object', 'properties': {'message_id': {'type': 'string'}}}
+    }
+}
+
+def fetch_old_image(message_id=''):
+    """Owner only. Fetch the message again from Discord (its picture links expire, a fresh fetch gets working ones), keep its pictures in the
+    agent's folder and add them to this turn's job. Says plainly when nothing was found, so no job gets handed an empty or made-up task."""
+    def no(why):
+        current['image_missing'] = True
+        have = saved_pictures()[:6]
+        return (f"❌ {why} Do not call delegate_task: tell them the picture could not be found."
+                + (f" (Pictures I do have saved: {', '.join(os.path.basename(p).split('-', 1)[-1] + ' = ' + os.path.basename(p).split('-', 1)[0] for p in have)}. "
+                   "Only if one of those is clearly the one they mean, call fetch_old_image again with its name or number.)" if have else ""))
+    if not is_owner(current['user_id']):
+        return "❌ " + not_owner_line()
+    arg = str(message_id or '').strip()
+    if re.sub(r'^the\s+', '', arg.lower()) in ('', 'latest', 'last', 'recent', 'newest', 'most recent', 'last one', 'previous'):
+        have = saved_pictures()[:1]  # "the image I sent earlier": the newest one she has
+    else:
+        have = saved_pictures(arg)
+    if have:  # already in the agent's folder (a picture sent to her, or fetched before): no need to ask Discord
+        return keep_pictures(have)
+    if LOOP is None:
+        return no("I can't reach Discord right now.")
+    if arg.isdigit():
+        mid = int(arg)
+        row = message_log.get(mid)
+    else:  # a file name that has been cleaned off the disk: the log knows which message it was in
+        row = message_log.find_image(arg)
+        if not row:
+            return no("That isn't a message number, and I have no saved or logged picture by that name.")
+        mid = row['id']
+    if not row:
+        return no("I have no record of that message.")
+    channel = client.get_channel(row['channel_id'])
+    if channel is None:
+        return no("That channel isn't available to me any more.")
+    async def go():
+        msg = await channel.fetch_message(mid)
+        return msg, await save_images(msg, anyone=True)
+    try:
+        msg, saved = asyncio.run_coroutine_threadsafe(go(), LOOP).result(timeout=60)
+    except discord.NotFound:
+        return no("That message was deleted from Discord.")
+    except (discord.HTTPException, TimeoutError, OSError) as e:
+        return no(f"Discord wouldn't give me that message ({type(e).__name__}).")
+    good = [p for p in saved if os.path.isfile(os.path.join(AGENT_DIR, p)) and os.path.getsize(os.path.join(AGENT_DIR, p)) > 0]
+    if not good:
+        return no("That message has no picture I can use (it may be too big, or not a png/jpg/webp).")
+    return keep_pictures(good, f" from {msg.author.display_name} ({msg.created_at.strftime('%Y-%m-%d %H:%M')})")
+
+def saved_pictures(match=''):
+    """Pictures in the agent's folder, newest first. With 'match', only those whose message number starts the name or whose name contains it."""
+    folder = os.path.join(AGENT_DIR, 'images')
+    try:
+        files = sorted((f for f in os.listdir(folder) if f.lower().endswith(IMAGE_EXTS) and os.path.getsize(os.path.join(folder, f)) > 0),
+                       key=lambda f: os.path.getmtime(os.path.join(folder, f)), reverse=True)
+    except OSError:
+        return []
+    m = match.lower()
+    if m:
+        files = [f for f in files if f.lower().startswith(m + '-') or (len(m) >= 3 and not m.isdigit() and m in f.lower())]
+    return [f"images/{f}" for f in files]
+
+def keep_pictures(paths, origin=''):
+    """These pictures go with this turn's job (and any picture job in this chat for a while); the answer says they were found."""
+    current['images'] = list(dict.fromkeys(list(current.get('images') or []) + paths))
+    current['image_missing'] = False
+    fetched_images[current['channel_id']] = (paths, time.time())
+    return (f"✅ Found {len(paths)} picture{'s' if len(paths) != 1 else ''}{origin}: {', '.join(os.path.basename(p).split('-', 1)[-1] for p in paths)}. "
+            "Now call delegate_task and say what to do with it; the picture goes with the job.")
+
+def search_chat_history(words, person='', days_back=None, since='', until='', server=''):
+    if not message_log.enabled():
+        return "❌ I'm not keeping a message history."
+    gid = current.get('guild_id')
+    owner = is_owner(current['user_id'])
+    if server and owner:  # only the owner can look into a server other than the one being talked in
+        found = message_log.guild_ids(server)
+        if not found:
+            return f"❌ I have no history for a server called '{server}'."
+        gid = found[0]
+    if gid is None:
+        return "❌ I search one server's history at a time: ask in that server" + (", or name the server." if owner else ".")
+    if isinstance(words, str):
+        words = [words]
+    people = None
+    if person:
+        if person.strip().lower() in ('me', 'i', 'myself', 'my'):
+            people = [current['user_id']]
+        elif person.strip().isdigit():
+            people = [int(person)]
+        else:
+            people = message_log.person_ids(gid, person)
+            if not people:
+                return f"No one called '{person}' has said anything I kept in that server."
+    guild = client.get_guild(gid)
+    rows, since_text = message_log.search(gid, words or [], people, days_back, since, until, readable_channels(guild, current.get('asker'), owner))
+    return message_log.render(rows, since_text, guild.name if guild else f"server {gid}")
 
 VIEW_CHARS = 6000  # one read of an agent's file or log returns at most this much; offset continues
 
@@ -1481,6 +1728,8 @@ look_at_agent_work_tool = {
 # Add new tools here (plus their schema) and every tool call site picks them up.
 TOOL_FUNCS = {
     'look_back': look_back,
+    'search_chat_history': search_chat_history,
+    'fetch_old_image': fetch_old_image,
     'look_at_agent_work': look_at_agent_work,
     'remember_about': remember_about,
     'recall_about': recall_about,
@@ -1498,6 +1747,7 @@ TOOL_FUNCS = {
     'delete_file': delete_agent_file,
     'delegate_task': delegate_task,
     'check_jobs': check_jobs,
+    'cancel_job': cancel_job,
     'generate_image': generate_image,
 }
 
@@ -1545,14 +1795,26 @@ def ollama_options(**extra):
         base["num_gpu"] = GPU_LAYERS
     return {**base, **extra}
 
+def _is_looping(text):
+    """True when the end of the text has already appeared at least twice before: it is going round in circles."""
+    return len(text) > 3000 and text.count(text[-300:]) >= 3
+
 def chat_streamed(label='💭', **kwargs):
     """ollama.chat that prints her thinking and her answer to the console as they arrive, then returns the assembled reply."""
     kwargs.pop('stream', None)
     content, thinking, tool_calls, mode, done_reason = '', '', [], None, None
     prompt_tokens = out_tokens = None
+    stream = _ollama_client.chat(stream=True, **kwargs)
+    checked = 0
     try:
-        for chunk in _ollama_client.chat(stream=True, **kwargs):
+        for chunk in stream:
             m = chunk.message
+            if len(thinking) - checked >= 1500:  # a model stuck saying the same thing over: stop it, don't wait for the token cap
+                checked = len(thinking)
+                if _is_looping(thinking):
+                    print("\n🔁 It is repeating itself; stopping this call.", flush=True)
+                    done_reason = 'length'
+                    break
             if m.thinking:
                 if mode != 'think':
                     print(f"\n{label} ", end='', flush=True)
@@ -1575,6 +1837,8 @@ def chat_streamed(label='💭', **kwargs):
     except httpx.TimeoutException:
         print("\n⚠️ The model's stream went silent for 4 minutes; giving up on this call.", flush=True)
         done_reason = 'timeout'
+    finally:
+        getattr(stream, 'close', lambda: None)()  # ends the request, so Ollama stops generating
     if mode:
         print(flush=True)
     return SimpleNamespace(message=SimpleNamespace(content=content, thinking=thinking, tool_calls=tool_calls),
@@ -1858,13 +2122,15 @@ def help_text(owner):
                 "or \"my reminders\". `!image examples` shows what the picture maker can do, if it's switched on. Everything else with a `!` is for my owner.")
     tiers = list(agent_cfg()['claude_models']) or ['model name']  # the tier names are whatever models.json says
     return ("**Commands** (all yours; `!help` shows this)\n"
-            "**Coding agent:** `!agent` (status), `!agent claude`, `!agent local`, `!agent model " + "|".join(tiers) + "|auto`, `!agent effort low|medium|high|xhigh|max|auto`. "
+            "**Coding agent:** `!agent` (status), `!agent claude`, `!agent local`, `!agent model " + "|".join(tiers) + "|auto`, `!agent effort low|medium|high|xhigh|max|auto`, `!agent stop [job number]` (give up on a job: no retries, no report). "
             "You can also say it in a message: \"use " + tiers[0] + " on low effort\".\n"
             f"**Voice calls:** {voice_chat.HELP}\n"
             "**Mood:** `!mood`, `!mood set <valence|energy|patience> <n>`, `!mood opinion <name> <n>`, `!mood ignore <name> [minutes]`, "
             "`!mood unignore <name>`, `!mood tolerance <name> <0-1|default>`, `!mood reset`, `!mood on|off`\n"
             "**Memory:** `!memory`, `!memory search <words>`, `!memory add <text>`, `!memory pin <text>`, `!memory forget <number or words>`, "
             "`!memory extract`, `!memory on|off`\n"
+            "**History:** I keep what is said in each server and can look it up (\"what did someone say about the regex parser?\"). "
+            "`!history forget mine|<message id>|from <user id>` erases from it.\n"
             "**Reminders:** `!remind` (everyone's pending ones), `!remind cancel <id>`, `!remind on|off`. Anyone sets one by asking her: "
             "\"remind me in 20 minutes to ...\"\n"
             f"**Pictures:** {IMAGE_HELP}\n"
@@ -1925,9 +2191,11 @@ async def handle_agent_command(message):
             agent_mode['effort'] = None
             return await reply("Effort is back to what you say in a message (\"on low effort\"), else the CLI's default.")
         return await reply("`!agent effort <" + "|".join(EFFORT_LEVELS) + "|auto>`")
+    if cmd in ('stop', 'cancel'):
+        return await reply(_cancel_jobs(parts[2] if len(parts) > 2 else ''))  # the owner check at the top of this handler already ran
     if cmd == 'status':
         return await reply(agent_status_text())
-    await reply("`!agent` (status), `!agent claude`, `!agent local`, `!agent model <" + "|".join(cfg['claude_models'] or ['model name']) + "|auto>`, `!agent effort <low|medium|high|xhigh|max|auto>`")
+    await reply("`!agent` (status), `!agent claude`, `!agent local`, `!agent model <" + "|".join(cfg['claude_models'] or ['model name']) + "|auto>`, `!agent effort <low|medium|high|xhigh|max|auto>`, `!agent stop [job number]`")
 
 def extract_call(prompt, schema):
     """One call to her model that picks the memories out of a conversation (see memory.py)."""
@@ -1983,6 +2251,45 @@ async def _cache_warm_loop():
 
 _cache_warm_task = None
 _memory_task = None
+_image_task = None
+
+def cleanup_saved_images():
+    """Delete the pictures kept for the coding agent once they are image_keep_hours old; fetch_old_image gets one back from Discord.
+    A picture a job is still using stays, and so does one that could not be fetched again (not in the message log) unless
+    image_delete_unrestorable is on. Returns how many were deleted."""
+    c = message_log.cfg()
+    hours = c['image_keep_hours']
+    folder = os.path.join(AGENT_DIR, 'images')
+    if not hours or hours <= 0 or not os.path.isdir(folder):
+        return 0
+    busy = {os.path.basename(p) for j in jobs.values() if j['status'] in ('queued', 'running') for p in (j.get('images') or [])}
+    cutoff, gone = time.time() - hours * 3600, 0
+    for f in os.listdir(folder):
+        path = os.path.join(folder, f)
+        try:
+            if not f.lower().endswith(IMAGE_EXTS) or not os.path.isfile(path) or os.path.getmtime(path) > cutoff or f in busy:
+                continue
+            head = f.split('-', 1)[0]
+            if not c['image_delete_unrestorable']:
+                row = message_log.get(int(head)) if head.isdigit() else None
+                if not row or row['deleted_ts']:
+                    continue  # it could not be fetched again
+            os.remove(path)
+            gone += 1
+        except OSError as e:
+            print(f"⚠️ couldn't clean up {f}: {e}")
+    if gone:
+        print(f"🧹 Deleted {gone} saved picture{'s' if gone != 1 else ''} older than {hours} hours.")
+    return gone
+
+async def _image_cleanup_loop():
+    """Once at start, then every image_check_minutes."""
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_saved_images)
+        except Exception as e:
+            print(f"⚠️ picture cleanup failed: {e}")
+        await asyncio.sleep(max(60, 60 * message_log.cfg()['image_check_minutes']))
 
 async def _memory_loop():
     """Every minute: look for memories in the chats that have built up enough, or gone quiet."""
@@ -2088,6 +2395,16 @@ async def handle_image_command(message):
         await post_picture(message, made['path'], f"seed {made['seed']}, {made['width']}x{made['height']}, {made['seconds']:.0f}s")
     finally:
         image_waiting[0] -= 1
+
+async def handle_history_command(message):
+    """!history forget mine | <message id> | from <user id>: erase from her message log. Who may is the who_can_forget setting."""
+    reply = lambda t: message.reply(t, mention_author=False)
+    parts = message.content.split(None, 2)
+    if len(parts) > 1 and parts[1].lower() == "forget":
+        return await reply(await asyncio.to_thread(message_log.forget, message.author.id, is_owner(message.author.id),
+                                                   parts[2] if len(parts) > 2 else "", message.guild.id))
+    await reply("`!history forget mine`" + (", `!history forget <message id>`, `!history forget from <user id>`" if is_owner(message.author.id) else "")
+                + ". I keep what is said in this server so I can look it up later; this erases it from my history.")
 
 async def handle_memory_command(message):
     """Owner's view of her long-term memory, and the controls."""
@@ -2208,12 +2525,15 @@ async def on_ready():
     mood.init(SimpleNamespace(state_path=os.path.join(SECURE_BOT_DIRECTORY, 'mood.json'), log=lambda t: print(t, flush=True),
         is_owner=is_owner, name_of=lambda uid: nickname_of(int(uid), f'user {uid}'), resolve=resolve_person,
         current_user=lambda: current['user_id'], appraise_call=appraise_call))
+    message_log.init()
     memory.init(SimpleNamespace(memory_path=os.path.join(SECURE_BOT_DIRECTORY, 'memories.md'), history_path=os.path.join(SECURE_BOT_DIRECTORY, 'chat_history.json'),
         log=lambda t: print(t, flush=True), known_names=known_names, name_of=lambda uid: nickname_of(int(uid), f'user {uid}'),
         current_user=lambda: current['user_id'], notes_tag=NOTES_TAG, model_lock=MODEL_LOCK, extract_call=extract_call))
     for cid, saved in memory.load_histories(SYSTEM_PROMPT).items():  # the chats she was in before a restart
         chat_histories.setdefault(cid, saved)
-    global _memory_task, _cache_warm_task
+    global _memory_task, _cache_warm_task, _image_task
+    if _image_task is None:
+        _image_task = asyncio.create_task(_image_cleanup_loop())
     if _memory_task is None:
         _memory_task = asyncio.create_task(_memory_loop())
     if _cache_warm_task is None:
@@ -2308,7 +2628,32 @@ async def room_for_chat(message):
 NO_ROOM_REPEAT_SECONDS = 300
 
 @client.event
+async def on_raw_message_edit(payload):
+    await asyncio.to_thread(message_log.edit, payload.message_id, payload.data.get('content'))
+
+@client.event
+async def on_raw_message_delete(payload):
+    await asyncio.to_thread(message_log.delete, [payload.message_id])
+
+@client.event
+async def on_raw_bulk_message_delete(payload):
+    await asyncio.to_thread(message_log.delete, list(payload.message_ids))
+
+async def log_message(message):
+    """Everything said in a server goes in the history log (even what she then ignores), but never DMs or the web page."""
+    if message.guild is None or getattr(message, 'is_web', False):
+        return
+    tags = " ".join(f"[{'image' if a.filename.lower().endswith(IMAGE_EXTS) else 'file'}: {a.filename}]" for a in (getattr(message, 'attachments', None) or []))
+    try:
+        await asyncio.to_thread(message_log.log, message.id, message.guild.id, message.guild.name, message.channel.id,
+                                getattr(message.channel, 'name', str(message.channel.id)), message.author.id, message.author.display_name,
+                                f"{message.content} {tags}".strip(), message.created_at.timestamp(), message.author.bot, message.author == client.user)
+    except Exception as e:
+        print(f"⚠️ couldn't log a message: {e}")
+
+@client.event
 async def on_message(message):
+    await log_message(message)
     if message.author == client.user:
         return
     uid = message.author.id
@@ -2319,6 +2664,9 @@ async def on_message(message):
         return
     if message.guild is not None and re.match(r"!memory\b", message.content.strip().lower()):
         await handle_memory_command(message)
+        return
+    if message.guild is not None and re.match(r"!history\b", message.content.strip().lower()):
+        await handle_history_command(message)
         return
     if message.guild is not None and re.match(r"!image\b", message.content.strip().lower()):
         await handle_image_command(message)
@@ -2388,9 +2736,7 @@ async def on_message(message):
 # Which models she uses is not in the code. It is the owner's choice, in ~/.sera/models.json (see the README), and any others can be put
 # there without touching this file: the chat and coding models are any Ollama models with tool support, Claude's are model ids, and the
 # picture model is a set of ComfyUI files (image_gen.py builds its workflow for Chroma-style models, so a very different picture model
-# would need that one function adapted). Nothing here requires an uncensored model.
-# The author runs an uncensored chat model (a "heretic" build of Gemma) and an uncensored picture model (Chroma), on purpose: it lets
-# the bot keep up with the inside jokes and the conversations between friends who trust each other. It does not leave her unchecked:
+# would need that one function adapted). She is not left unchecked:
 #   - the owner can force her to ignore a person (`!mood ignore <name> [minutes]`), tune how she treats them (`!mood tolerance`,
 #     `!mood opinion`), and she can ignore someone herself (the ignore_person tool);
 #   - pictures go through image_safety.py, and one it cannot clear is refused;
@@ -2443,6 +2789,27 @@ SYSTEM_PROMPT = sera_home.persona(default='''
 
 ''')
 
+IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.webp')
+
+async def save_images(message, anyone=False):
+    """The owner's picture attachments, saved into the coding agent's folder (images/) so a job can look at them; returns their paths
+    relative to that folder. Her own model can't see images, but the coding models can. Only the owner can start jobs, so only theirs are kept."""
+    if getattr(message, 'is_web', False) or not message.attachments or not (anyone or is_owner(message.author.id)):
+        return []
+    saved = []
+    folder = os.path.join(AGENT_DIR, 'images')
+    for a in message.attachments:
+        if not a.filename.lower().endswith(IMAGE_EXTS) or a.size > MAX_ATTACHMENT_BYTES:
+            continue
+        name = f"{message.id}-{re.sub(r'[^A-Za-z0-9._-]', '_', a.filename)}"
+        try:
+            os.makedirs(folder, exist_ok=True)
+            await a.save(os.path.join(folder, name))
+            saved.append(f"images/{name}")
+        except (discord.HTTPException, OSError) as e:
+            print(f"⚠️ couldn't keep the picture {a.filename}: {e}")
+    return saved
+
 async def handle_message(message):
     if message.author == client.user:
         return
@@ -2486,7 +2853,7 @@ async def handle_message(message):
         active_sessions.pop((channel_id, user_id), None)
         return
     keep_session(channel_id, user_id)
-    current.update(channel_id=channel_id, user_id=user_id, message_id=message.id, difficulty=None, model_pref=asked_model(message.content), effort_pref=asked_effort(message.content))
+    current.update(images=await save_images(message), image_missing=False, guild_id=message.guild.id if message.guild else None, asker=message.author, channel_id=channel_id, user_id=user_id, message_id=message.id, difficulty=None, model_pref=asked_model(message.content), effort_pref=asked_effort(message.content))
     await asyncio.to_thread(note_person, user_id, message.author.display_name, message.author.bot)
     await asyncio.to_thread(mood.note_presence, user_id)  # someone she likes turning up lifts her mood, someone she doesn't drags it down
 
@@ -2556,7 +2923,12 @@ async def handle_message(message):
                 continue
             if any(filename.endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.webp']):
                 # her model can't see images, and one in her history broke every later call: tell her instead
-                user_message['content'] += f"\n\n[The user attached an image ({attachment.filename}). You cannot see images; say so.]"
+                if current.get('images'):
+                    user_message['content'] += (f"\n\n[The user attached an image ({attachment.filename}). You cannot see images yourself, but your coding agent can, "
+                                                f"and it will be given the picture. If they want it looked at, read, described or used, call delegate_task and say what to "
+                                                f"do with it; do not tell them it can't be done.]")
+                else:
+                    user_message['content'] += f"\n\n[The user attached an image ({attachment.filename}). You cannot see images; say so.]"
                 break
             elif filename.endswith('.pdf'):
                 async with httpx.AsyncClient() as http_client:
@@ -2584,7 +2956,8 @@ async def handle_message(message):
     chat_histories[channel_id].append(user_message)
     notebook.trim(chat_histories[channel_id])  # in one cut, not one message at a time, so what stays starts the same way each turn
     notebook.age_out(channel_id, chat_histories[channel_id], NOTES_TAG)
-    await asyncio.to_thread(refresh_notes, channel_id)  # what she remembers about the people here, refreshed every message
+    related = await asyncio.to_thread(auto_history, message)  # if they talk as if she should remember something, the matching old messages
+    await asyncio.to_thread(refresh_notes, channel_id, related)  # what she remembers about the people here, refreshed every message
     addr = new_addr(message.id, user_id)  # her first answer to this message replies to it or pings, if the chat moved on
 
 
@@ -2594,6 +2967,12 @@ async def handle_message(message):
                          remember_tool, recall_tool, nickname_tool, ignore_tool, unignore_tool, note_tool]
             if is_owner(user_id) and image_gen.available() and (getattr(message, 'is_web', False) or image_gen.discord_on()):
                 all_tools.append(generate_image_tool)  # only the owner's chat is offered it: a picture takes the whole GPU
+            if message_log.enabled() and (message.guild is not None or is_owner(user_id)):
+                all_tools.append(search_history_tool)  # a server's history, searched from that server (the owner can name another)
+            if is_owner(user_id) and message_log.enabled():
+                all_tools.append(fetch_image_tool)  # the owner's chat only: it leads to a coding job
+            if is_owner(user_id) and any(j['status'] in ('queued', 'running') for j in jobs.values()):
+                all_tools.append(cancel_job_tool)  # only offered while there is something to stop
             if notebook.count(channel_id):
                 all_tools.append(notebook.look_back_tool)  # only offered once there is something in the notebook
             if is_owner(user_id) and agent_view_available():
@@ -2622,13 +3001,12 @@ async def handle_message(message):
                 ]
             
                 def _sync_planner():
-                    return chat_streamed(model=MODEL_NAME, messages=plan_prompt, tools=[], think=True, keep_alive=KEEP_ALIVE, options=ollama_options(temperature=0.4))
+                    return chat_streamed(model=MODEL_NAME, messages=plan_prompt, tools=[], think=True, keep_alive=KEEP_ALIVE, options=ollama_options(temperature=0.4, num_predict=PLAN_TOKENS))
             
                 plan_res = await asyncio.to_thread(_sync_planner)
                 plan_text = plan_res.message.content or ""
             
-                # Display plan to Discord so you see it locked in
-                await send_long(message.channel, f"📋 **Locked Plan:**\n{plan_text}")
+                # The plan is printed in the terminal only; it is never posted in the chat
                 print(f"📋 Plan generated:\n{plan_text}\n")
             
                 # Parse plan lines into a clean Python list
@@ -2639,9 +3017,13 @@ async def handle_message(message):
                         parsed_steps.append(re.sub(r'^\d+[\.\)]\s+', '', clean))
                 if not parsed_steps:
                     parsed_steps = [s.strip() for s in plan_text.split('\n') if s.strip()]
+                if not parsed_steps:  # the planner ran out of room or went round in circles: just answer, don't go quiet
+                    print("⚠️ No plan came back; answering directly.")
+                    parsed_steps = [None]
 
                 # Add assistant plan statement to history
-                chat_histories[channel_id].append({'role': 'assistant', 'content': f"Plan:\n{plan_text}"})
+                if plan_text.strip():
+                    chat_histories[channel_id].append({'role': 'assistant', 'content': f"Plan:\n{plan_text}"})
 
             # --- PHASE 2 & 3: BLIND EXECUTION WITH RECOVERY MEDIC ---
             sent_replies = set()
@@ -2696,6 +3078,7 @@ async def handle_message(message):
 
                 # Execute any tool calls requested for this step
                 looked = False
+                handed_off = False
                 if hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls:
                     for t in assistant_msg.tool_calls:
                         tname = t.function.name
@@ -2710,9 +3093,11 @@ async def handle_message(message):
                         else:
                             await send_long(message.channel, res)
                         print(f"Result: {res}")
+                        if tname == 'delegate_task' and res.startswith('🛠️'):
+                            handed_off = True
 
                         # --- PHASE 3: RECOVERY CHECK (If tool failed, call Medic) ---
-                        if res.startswith("❌") and tname not in ('look_back', 'look_at_agent_work'):
+                        if res.startswith("❌") and tname not in NO_MEDIC:
                             print(f"🚨 Step {step_num} failed! Invoking Recovery Medic (Think=True)...")
                             await message.channel.send(f"⚠️ *Step {step_num} hit an error. Analyzing fix...*")
                             
@@ -2729,7 +3114,7 @@ async def handle_message(message):
                                     tools=all_tools,
                                     think=True,
                                     keep_alive=KEEP_ALIVE,
-                                    options=ollama_options(temperature=0.2),
+                                    options=ollama_options(temperature=0.2, num_predict=MEDIC_TOKENS),
                                     stream=False
                                 )
                             
@@ -2761,6 +3146,9 @@ async def handle_message(message):
                                 await send_long(message.channel, follow.message.content, addr, mentions=True)
                         except asyncio.TimeoutError:
                             await message.channel.send("⚠️ *I read my notes but took too long to answer. Ask me again.*")
+
+                if handed_off:  # the job's result doesn't exist yet, so the steps after it can only make something up; it is posted when it finishes
+                    break
 
             print("💬 [All Plan Steps Completed]\n")
             if shrunk:

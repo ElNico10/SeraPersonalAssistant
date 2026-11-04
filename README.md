@@ -17,14 +17,11 @@ Claude Code CLI; the picture model is a set of ComfyUI files (the picture workfl
 models, so a very different picture model would need that one function adapted). If a model is not set, the feature that needs it
 says so and stays off, and she will not start without a chat model.
 
-What follows is what the author runs, and why. The chat and picture models are uncensored on purpose: the bot lives among friends
-who trust each other, and it needs to keep up with their inside jokes and conversations. It is not left unchecked: the owner can
-make her ignore or restrict a person, pictures go through a safety filter, the tools that touch the host are guarded in code, and the
-default prompt that ships with the code has its own safety rules. Nothing here requires an uncensored model.
+What follows is the setup she was built and tested on. She is not left unchecked: the owner can make her ignore or restrict a person, pictures go through a safety filter, the tools that touch the host are guarded in code, and the default prompt that ships with the code has its own safety rules.
 
 | Job | Model | Where it runs |
 |---|---|---|
-| Chat, intent checks, planning | `igorls/gemma-4-12B-it-heretic-GGUF` (7.4 GB on disk) | Ollama, GPU. 32,768-token context, unloads 2 min after the last call |
+| Chat, intent checks, planning | a 12B Gemma 4 GGUF build, set in `models.json` (about 7.4 GB on disk) | Ollama, GPU. 32,768-token context, unloads 2 min after the last call |
 | Default coding agent (public) | `qwen3.6:35b-a3b-coding` (22 GB on disk) | Ollama |
 | Coding agent (owner only, `!agent claude`) | Claude Haiku 5.5 / Sonnet 5.5 / Opus 5.5, picked per task or by name | Claude Code CLI |
 | Speech to text | faster-whisper `small` | CPU, 4 threads |
@@ -93,6 +90,10 @@ before) if `nvidia-smi` or Ollama can't be asked; set `"enabled": false` in the 
 - **Coding agents:** work happens in a folder under the workspace, and code runs only in a Docker sandbox (no network, read-only
   filesystem, 256 MB scratch, 30 s default limit). The `sera-sandbox` image carries C/C++, C#, Go, Rust, Java, Node/TypeScript,
   Python, R, Ruby, PHP, Lua, Perl, Fortran, SQLite and a headless browser for HTML.
+- **Message history:** every message said in a server (hers too, never DMs or the web page) is logged to `~/.sera/message_log.db` with who, where and when. She never reads it on her own; she searches it with a tool ("what did someone say about the regex parser?"): any of several words, an optional person, and a time window that is a day or two unless asked for more (capped by `max_days_back`, or exact dates). A search stays in the server it's asked in, and only covers channels the asker can read themselves (if that can't be worked out, nothing); only the owner can name another server or skip that check. She also looks by herself, with no model call, when a message sounds like she should remember something ("remember what I said yesterday about the parser?"): the matching old messages are put in her notes for that reply, under the same rules. Results are quoted as information, never instructions. Pictures and files show up in it as `[image: name]` tags; the owner can have her re-fetch an old picture from Discord for the coding agent (she checks it was really found before any job starts). Edits keep the earlier wording; deleted messages stay marked as deleted. `message_log_config.json` sets all of it (`keep_days`, `on_edit`, `on_delete`, `who_can_forget`, ...), and `!history forget` erases from the log.
+- **Old pictures clean up after themselves:** pictures saved for the coding agent are deleted after a day (`image_keep_hours`, checked every `image_check_minutes`); she gets one back from Discord with `fetch_old_image`, through the message log. One a job is using, or one that could not be fetched again, is kept.
+- **Giving up on a job:** tell her to stop ("give up on that") or use `!agent stop [job number]`. A cancelled job is not retried, reviewed or reported; the local agent stops at its next round, and a Claude session is ended.
+- **Pictures to the coder:** her own model can't see images, but the coding models can. A picture the owner attaches is saved in the agent's folder (`images/`) and handed to any coding job started from that message, so she can say "have the coder look at this" instead of refusing.
 - **Claude mode (owner only):** `!agent claude` swaps the agents to Claude; `!agent model <name>` and `!agent effort <level>` pin the
   model and effort. Sessions stay open between jobs and are cleared with `/clear`; transcripts go to `.history/`. Resets on restart.
 - **Pictures:** see `IMAGES.md`.
@@ -131,7 +132,7 @@ before) if `nvidia-smi` or Ollama can't be asked; set `"enabled": false` in the 
    Without the optional files (all but `models.json`) she runs on safe defaults written out in the code, right next to where each is used (search for
    `sera_home.` in `discord_bot.py`, `mood.py`, `reminders.py` and `voice_chat.py`). To make her your own, copy a default into
    `~/.sera` under the name above and edit it. A note above `SYSTEM_PROMPT` in `discord_bot.py` says which of her models are
-   uncensored, why, and what limits her.
+   which of her models she uses and what limits her.
 
    The web page's token (`web_token.txt`) is created in the same folder the first time she runs.
 5. Optional extras that are **not in this repository** (they are large, and ignored by git). Each feature stays off without its part:
@@ -149,6 +150,7 @@ before) if `nvidia-smi` or Ollama can't be asked; set `"enabled": false` in the 
 | `discord_bot.py` | the bot: chat, triage, tools, agents, commands |
 | `sera_home.py` | reads her private files from `~/.sera` (persona, canned replies, models), with safe defaults |
 | `vram_guard.py`, `vram_guard_config.json` | lets her stay up beside a game: refuses to load models when the GPU is taken |
+| `message_log.py`, `message_log_config.json` | the searchable history of what is said in each server |
 | `console_guard.py` | keeps a paused Windows console from freezing the bot |
 | `notebook.py` | notebook and efficiency settings |
 | `claude_sessions.py` | kept-open Claude CLI sessions |

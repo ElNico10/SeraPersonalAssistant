@@ -87,16 +87,17 @@ def _want(feature, c, chat_in, coding_in, pic_up):
     """(MiB this start needs free, MiB it can take back from what Sera already holds)."""
     n = c["needs_mb"]
     held = (n["chat"] if chat_in else 0) + (n["coding"] if coding_in else 0) + (n["picture_idle"] if pic_up else 0)
-    if feature == "chat":
-        return (0 if chat_in else n["chat"]), 0
+    if feature == "chat":  # Ollama evicts the coding model to make room for her chat model, so what it holds comes back
+        return (0 if chat_in else n["chat"]), (n["coding"] if coding_in else 0)
     if feature == "coding":
         return (0 if coding_in else n["coding"]), (n["chat"] if chat_in else 0)  # her chat model steps out for it
     if feature == "picture":
         return (0 if pic_up else n["picture"]), (n["chat"] if chat_in else 0) + (n["coding"] if coding_in else 0)
     if feature == "voice":
+        back = n["coding"] if coding_in else 0
         if chat_in:  # joining reloads her model on fewer layers, which gives back the difference
-            return n["voice"], n["chat"] - n["chat_in_call"]
-        return n["voice"] + n["chat_in_call"], 0
+            return n["voice"], n["chat"] - n["chat_in_call"] + back
+        return n["voice"] + n["chat_in_call"], back
     return 0, held
 
 

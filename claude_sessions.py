@@ -7,7 +7,7 @@ import json, subprocess, threading
 class _Session:
     def __init__(self, popen, argv, cwd):
         self.p = popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1)
-        self.jobs, self.last_total, self.busy, self.close_after = 0, 0, False, False
+        self.jobs, self.last_total, self.busy, self.close_after, self.cancelled = 0, 0, False, False, False
 
     def alive(self):
         return self.p.poll() is None
@@ -69,7 +69,7 @@ class SessionPool:
                 with self._lock:
                     self._s.pop(model, None)
                     s.close()
-                if fresh or attempt == 2:
+                if fresh or attempt == 2 or s.cancelled:  # a cancelled job is not run again on a fresh session
                     raise
                 continue  # a session that had been open a while failed: one try on a fresh one
             u = ev.get("usage") or {}
@@ -81,6 +81,16 @@ class SessionPool:
                     self._s.pop(model, None)  # worn out, or the owner turned Claude off during this job
                     s.close()
                 return ev, s.jobs
+
+    def kill(self, model):
+        """Stop whatever model's session is doing right now by ending its process; the job running in it fails and is not retried."""
+        with self._lock:
+            s = self._s.get(model)
+            if s and s.busy:
+                s.cancelled = True
+                s.close()
+                return True
+        return False
 
     def status(self):
         """[(model, jobs done, busy)] for the sessions that are open."""

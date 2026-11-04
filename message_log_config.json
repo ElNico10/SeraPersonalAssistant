@@ -1,0 +1,19 @@
+{
+  "_help": "Edit while the bot runs. The log itself is ~/.sera/message_log.db. on_delete: keep = a message deleted in Discord stays, marked deleted; remove = it is erased here too. on_edit: append = an edited message keeps its earlier wording and a search finds either; replace = the new text overwrites it. who_can_forget: owner = only the owner can erase messages with !history forget; author = people can erase their own. keep_days 0 = keep forever. max_days_back 0 = no limit on how far a search without dates can reach. auto_recall: when a message sounds like she should remember something, the matching old messages are put in her notes without her asking (auto_days_back, auto_max_results). image_keep_hours: pictures saved for the coding agent are deleted after this many hours (0 = never) and fetched again from Discord when needed; image_check_minutes: how often the check runs; image_delete_unrestorable: also delete pictures that could not be fetched again (a DM, or a message not in the log).",
+  "enabled": true,
+  "keep_days": 0,
+  "default_days_back": 2,
+  "max_days_back": 90,
+  "max_results": 15,
+  "max_chars_each": 300,
+  "on_delete": "keep",
+  "who_can_forget": "owner",
+  "on_edit": "append",
+  "log_bots": true,
+  "auto_recall": true,
+  "auto_days_back": 7,
+  "auto_max_results": 5,
+  "image_keep_hours": 24,
+  "image_check_minutes": 60,
+  "image_delete_unrestorable": false
+}
