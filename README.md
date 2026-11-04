@@ -64,6 +64,26 @@ beside the chat model.
 Her chat/plan/code classification step got 22 of 22 right on a hand-labelled set of 22 short messages (median 0.34 s per call). Those
 prompts were short, so real replies with her full prompt take longer. Voice and picture models were not benchmarked.
 
+### Staying up while you use the GPU
+
+She can run all day beside a game. Before anything that would load a model onto the card (her chat model, a voice call, a picture,
+a coding job), `vram_guard.py` asks the GPU how much memory is free. If the feature won't fit, with a little headroom left over, it
+is not started and she says so: that her owner is using the PC and left no room for that feature. Things already loaded are never
+unloaded by it, so a conversation in progress is not cut off. A model Ollama has unloaded (after 2 idle minutes) is simply not
+reloaded until there is room. The numbers are in `vram_guard_config.json`, measured on the RTX 5070 as the growth in used VRAM when each
+feature loads, plus 600 MiB of headroom:
+
+| Feature | VRAM it needs |
+|---|---|
+| Chat model, all layers, 32,768 context | 8.3 GB |
+| Chat model with 44 of 48 layers (during a call) | 7.6 GB |
+| Voice model | 2.4 GB |
+| Picture model at its peak | 9.5 GB (5.5 GB while it sits idle) |
+| Coding model (rest in system RAM) | 9.6 GB |
+
+She repeats the notice in a channel at most every 5 minutes and stays quiet otherwise. The check fails open (she carries on as
+before) if `nvidia-smi` or Ollama can't be asked; set `"enabled": false` in the config to turn it off. Re-measure the numbers for another card.
+
 ## What she does
 
 - **Chat** with per-person nicknames, remembered facts, a mood that drifts with how people treat her, and reminders (up to 7 days out).
@@ -128,6 +148,7 @@ prompts were short, so real replies with her full prompt take longer. Voice and 
 |---|---|
 | `discord_bot.py` | the bot: chat, triage, tools, agents, commands |
 | `sera_home.py` | reads her private files from `~/.sera` (persona, canned replies, models), with safe defaults |
+| `vram_guard.py`, `vram_guard_config.json` | lets her stay up beside a game: refuses to load models when the GPU is taken |
 | `console_guard.py` | keeps a paused Windows console from freezing the bot |
 | `notebook.py` | notebook and efficiency settings |
 | `claude_sessions.py` | kept-open Claude CLI sessions |

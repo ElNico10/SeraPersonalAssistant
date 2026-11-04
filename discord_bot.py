@@ -26,6 +26,7 @@ import reminders
 import web_ui
 import image_gen
 import image_safety
+import vram_guard
 from dotenv import load_dotenv
 
 console_guard.install()  # a paused console (text selected in it) must not freeze the bot
@@ -59,6 +60,16 @@ BOT_TRIGGERS = sera_home.behaviour("BOT_TRIGGERS", [
 MODEL_NAME = sera_home.model('chat')
 if not MODEL_NAME:
     sys.exit('No chat model is set. Create ' + sera_home.path('models.json') + ' containing {"chat": "<an Ollama model name>"} (see the README).')
+
+# Starting her chat model with the GPU full (a game running) would stall both. Every call that would LOAD it first asks vram_guard whether
+# it fits, and raises vram_guard.NoRoom if not; calls while it is already loaded, and unloads (keep_alive=0), go straight through.
+def _guarded(call):
+    def guarded(*args, **kwargs):
+        if kwargs.get('model') == MODEL_NAME and kwargs.get('keep_alive') != 0:
+            vram_guard.require('chat')
+        return call(*args, **kwargs)
+    return guarded
+ollama.chat, ollama.generate, _ollama_client.chat = _guarded(ollama.chat), _guarded(ollama.generate), _guarded(_ollama_client.chat)
 
 # Every Ollama call must use the same num_ctx, or Ollama reloads the model between calls.
 NUM_CTX = 32768        # the model's default (131072) pre-reserves a huge KV cache in VRAM
@@ -962,6 +973,10 @@ def delegate_task(task, difficulty=''):
             return "❌ Claude mode is on but no Claude models are set (models.json, see the README)."
     elif not AGENT_MODEL:
         return "❌ No local coding model is set (models.json, see the README), so there is no coding agent to hand this to."
+    else:
+        fits, why = vram_guard.check('coding')
+        if not fits:
+            return f"❌ {why}"
     job_id = len(jobs) + 1
     jobs[job_id] = {'task': task, 'status': 'queued', 'result': '', 'channel_id': current['channel_id'],
                     'attempts': 0, 'feedback': '', 'user_id': current['user_id'], 'message_id': current['message_id'],
@@ -2274,6 +2289,24 @@ async def dm_brush_off(message):
     await message.channel.send(random.choice(DM_LINES))
     await asyncio.to_thread(ignore_dms, uid, message.author.display_name)
 
+no_room_told = {}  # channel id -> when she last said she had no room, so she says it once in a while, not to every message
+
+async def room_for_chat(message):
+    """True if her model is loaded or fits; otherwise tells the channel once every few minutes and returns False."""
+    fits, why = await asyncio.to_thread(vram_guard.check, 'chat')
+    if fits:
+        return True
+    cid = message.channel.id
+    if time.time() - no_room_told.get(cid, 0) > NO_ROOM_REPEAT_SECONDS:
+        no_room_told[cid] = time.time()
+        try:
+            await message.reply(why, mention_author=False)
+        except discord.HTTPException:
+            pass
+    return False
+
+NO_ROOM_REPEAT_SECONDS = 300
+
 @client.event
 async def on_message(message):
     if message.author == client.user:
@@ -2309,6 +2342,9 @@ async def on_message(message):
             and voice_chat.looks_like_voice_request(message.content)):
         if await voice_chat.handle_natural_request(message):  # "sera join vc", "leave the call"
             return
+    if (not message.author.bot and (any(message_hint(message)) or (message.guild is None and is_owner(uid)))
+            and not await room_for_chat(message)):
+        return  # her model can't load while the owner has the GPU; she has said so
     if (message.guild is not None and not message.author.bot and any(message_hint(message))
             and reminders.looks_like_request(message.content)):
         said = await handle_reminder_text(message.clean_content, uid, nickname_of(uid, message.author.display_name), message.channel.id,

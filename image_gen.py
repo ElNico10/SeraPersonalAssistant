@@ -19,6 +19,7 @@ import uuid
 
 import image_safety
 import sera_home
+import vram_guard
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 COMFY_DIR = os.path.join(HERE, "image_gen", "ComfyUI")
@@ -125,7 +126,8 @@ def stop():
     """Stop ComfyUI altogether (frees everything it holds)."""
     global _proc
     if _proc and _proc.poll() is None:
-        _proc.terminate()
+        # the venv's python.exe is only a launcher; terminate() alone leaves the real ComfyUI (and its VRAM) running, so kill the whole tree
+        subprocess.run(["taskkill", "/PID", str(_proc.pid), "/T", "/F"], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         try:
             _proc.wait(15)
         except subprocess.TimeoutExpired:
@@ -181,6 +183,9 @@ def generate(prompt, negative=None, width=None, height=None, steps=None, guidanc
     seed = int(seed) if seed not in (None, "", -1) else random.randrange(2 ** 32)
     if width * height > c["max_pixels"]:
         raise RuntimeError(f"{width}x{height} is bigger than the {c['max_pixels']} pixel limit")
+    fits, why = vram_guard.check("picture")  # before the safety check, which needs her language model loaded
+    if not fits:
+        raise RuntimeError(why)
     say("checking the request…")
     image_safety.check(prompt, getattr(env, "safety_ask", None))  # raises image_safety.Refused; nothing is started or unloaded for a refused request
     negative = negative if negative is not None else c.get("negative", NEGATIVE)

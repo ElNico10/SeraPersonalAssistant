@@ -1,0 +1,13 @@
+{
+  "_help": "Edit while she runs (re-read on each check). Numbers are MiB of VRAM measured on an RTX 5070 as the growth in used memory when each feature loads. headroom_mb is kept free on top. Set enabled to false to turn the guard off. Re-measure for another card.",
+  "enabled": true,
+  "headroom_mb": 600,
+  "needs_mb": {
+    "chat": 8330,
+    "chat_in_call": 7590,
+    "voice": 2400,
+    "picture": 9500,
+    "picture_idle": 5500,
+    "coding": 9610
+  }
+}

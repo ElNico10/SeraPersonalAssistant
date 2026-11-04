@@ -9,6 +9,7 @@ separate worker processes (voice_worker.py) in their own Python environments; vo
 """
 import asyncio
 import sera_home
+import vram_guard
 import collections
 import json
 import logging
@@ -1236,6 +1237,10 @@ async def join_call(message, reply):
     except ImportError:
         return await reply(INSTALL_HELP)
     moving = session is not None
+    if not moving:  # moving between channels keeps the models she already has
+        fits, why = await asyncio.to_thread(vram_guard.check, "voice")
+        if not fits:
+            return await reply(why)
     if moving:
         await disconnect_session(gid, keep_models=True)
     try:
