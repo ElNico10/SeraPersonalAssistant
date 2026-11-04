@@ -17,6 +17,9 @@ Claude Code CLI; the picture model is a set of ComfyUI files (the picture workfl
 models, so a very different picture model would need that one function adapted). If a model is not set, the feature that needs it
 says so and stays off, and she will not start without a chat model.
 
+The harness is built to handle abliterated and "heretic" models as well as standard, unmodified (OEM) ones. The original Sera runs on a
+heretic, abliterated model (a Gemma 4 build), so it is known to work with one.
+
 What follows is the setup she was built and tested on. She is not left unchecked: the owner can make her ignore or restrict a person, pictures go through a safety filter, the tools that touch the host are guarded in code, and the default prompt that ships with the code has its own safety rules.
 
 | Job | Model | Where it runs |
