@@ -26,6 +26,16 @@
         "cpu_threads": 4
       }
     },
+    "faster_whisper_music": {
+      "engine": "faster_whisper",
+      "python": "voice_envs/stt/Scripts/python.exe",
+      "options": {
+        "model": "small",
+        "device": "cpu",
+        "cpu_threads": 4,
+        "beam_size": 5
+      }
+    },
     "sapi": {
       "python": "voice_envs/tts/Scripts/python.exe",
       "options": {}

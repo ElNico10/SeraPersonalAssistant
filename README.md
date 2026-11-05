@@ -90,6 +90,7 @@ before) if `nvidia-smi` or Ollama can't be asked; set `"enabled": false` in the 
 - **Efficiency:** long plans, tool results and files go to a per-chat notebook and come back with `look_back`; one merged triage call
   decides whether a message is for her and whether it is chat, plan or code. See `EFFICIENCY.md`.
 - **Voice calls:** listens, replies out loud, keeps up with several speakers, plays a soft thinking sound while she works. See `VOICE.md`.
+- **Music mode:** joins a call with only speech recognition on the CPU (nothing on the GPU), waits for "hey sera", and plays Spotify through a virtual audio cable; "hey sera, switch to voice" changes to a normal call. See `MUSIC.md`.
 - **Coding agents:** work happens in a folder under the workspace, and code runs only in a Docker sandbox (no network, read-only
   filesystem, 256 MB scratch, 30 s default limit). The `sera-sandbox` image carries C/C++, C#, Go, Rust, Java, Node/TypeScript,
   Python, R, Ruby, PHP, Lua, Perl, Fortran, SQLite and a headless browser for HTML.
@@ -159,6 +160,7 @@ before) if `nvidia-smi` or Ollama can't be asked; set `"enabled": false` in the 
 | `claude_sessions.py` | kept-open Claude CLI sessions |
 | `agent_sandbox.py`, `sandbox_mcp.py`, `sandbox/` | Docker sandbox and its tool server |
 | `voice_chat.py`, `voice_worker.py` | voice calls and the speech workers |
+| `music_mode.py`, `spotify_client.py`, `music_config.json` | music mode: wake word and commands, the Spotify API client, settings |
 | `memory.py`, `mood.py`, `reminders.py` | memories, feelings, reminders |
 | `image_gen.py`, `image_safety.py` | pictures |
 | `web_ui.py`, `web/` | local web page |

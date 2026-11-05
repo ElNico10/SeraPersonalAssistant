@@ -2,4 +2,5 @@
 # The speech models themselves run in separate environments under voice_envs/ and are not listed here.
 PyNaCl>=1.5
 davey>=0.1.7
+sounddevice>=0.5  # music mode only: reads the virtual audio cable Spotify plays into
 discord-ext-voice-recv @ git+https://github.com/imayhaveborkedit/discord-ext-voice-recv

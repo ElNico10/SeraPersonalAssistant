@@ -86,9 +86,9 @@ class FasterWhisperSTT:
     (on the CPU: how many cores it may use, so reading what people said while she talks doesn't fight her own CPU layers).
     A GPU that fails its self-test falls back to the CPU, so a bad driver or a missing library never leaves her deaf."""
 
-    def __init__(self, model="small", device="cpu", compute_type=None, cpu_threads=0, **_):
+    def __init__(self, model="small", device="cpu", compute_type=None, cpu_threads=0, beam_size=5, **_):
         from faster_whisper import WhisperModel
-        self.device = device
+        self.device, self.beam_size = device, beam_size  # beam_size 1 = greedy decoding: about twice as fast, slightly less exact
         if device == "cuda":
             add_nvidia_dll_paths()
             try:
@@ -105,7 +105,7 @@ class FasterWhisperSTT:
         """One clip: its text. Several clips joined into one file (bounds = [[start, end], ...] in seconds): one text per clip,
         found by giving each word to the clip it was spoken in. Whisper always works on 30-second windows, so five 3-second
         clips cost five passes apart and about one together."""
-        kwargs = dict(language=None if language in (None, "", "auto") else language, beam_size=5, vad_filter=True, initial_prompt=hints or None)
+        kwargs = dict(language=None if language in (None, "", "auto") else language, beam_size=self.beam_size, vad_filter=True, initial_prompt=hints or None)
         if not bounds:
             segments, info = self.model.transcribe(path, **kwargs)
             return " ".join(s.text.strip() for s in segments).strip(), info.language

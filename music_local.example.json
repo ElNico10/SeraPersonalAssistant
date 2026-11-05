@@ -1,0 +1,6 @@
+{
+  "routing": {
+    "enabled": true,
+    "normal_output": "<your headphones' device>\\Device\\Speakers\\Render"
+  }
+}

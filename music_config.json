@@ -1,0 +1,22 @@
+{
+  "_help": "Music mode settings, re-read for every line she hears. who_can_control: 'owner' or 'anyone' (anyone in the call who says her name) for everything. who_can_queue: 'anyone' (default) or 'owner': whether people other than the owner may add songs to the queue ('hey sera, queue ...') when who_can_control is 'owner'; they can't play, pause, skip, change the volume, switch modes or make her leave. wake_words: the spellings that count as her name; Whisper often hears 'Sera' as 'Sarah' or 'Sierra', so take one out if someone in the call really has that name. need_greeting: true = only 'hey sera ...' counts, not a bare 'sera ...'. follow_seconds: after a lone 'hey sera', how long the next thing said counts as the request. capture_device: part of the name of the audio input the Spotify app plays into (the virtual cable). spotify_device: part of a Spotify device name to always use; empty = the one playing, else this PC. volume_step: percent per 'raise volume'/'lower volume'. buffer_ms: sound kept ready for the call (more = fewer glitches, more delay). silence_seconds: how long you must be quiet before she takes what you said as finished (shorter = faster commands, but a pause in the middle of a song title can split it; a lone 'hey sera, play' is remembered and joined to what follows). routing: with enabled=true she points the Spotify app's output at the virtual cable when music mode starts and back to normal_output when it ends (using NirSoft's SoundVolumeView in tools/). Put this PC's device names in ~/.sera/music_local.json (see music_local.example.json), not here. normal_output empty = Windows' default output. log_heard: true prints every line Whisper hears (for anyone in the call) in the terminal, to see why she missed her name; leave it off normally. stt_engine: which speech engine in voice_config.json hears you; it must run on the CPU (device 'cpu') so the GPU stays free.",
+  "who_can_control": "owner",
+  "who_can_queue": "anyone",
+  "wake_words": ["sera", "seraphim", "sarah", "sara", "sierra", "cera", "serra"],
+  "need_greeting": false,
+  "follow_seconds": 10,
+  "capture_device": "CABLE Output (VB-Audio Virtual Cable)",
+  "spotify_device": "",
+  "volume_step": 10,
+  "buffer_ms": 300,
+  "silence_seconds": 0.5,
+  "routing": {
+    "enabled": false,
+    "tool": "tools/soundvolumeview/app/SoundVolumeView.exe",
+    "app": "Spotify.exe",
+    "music_output": "VB-Audio Virtual Cable\\Device\\CABLE Input\\Render",
+    "normal_output": ""
+  },
+  "log_heard": false,
+  "stt_engine": "faster_whisper_music"
+}

@@ -492,8 +492,16 @@ class _NoTyping:
 
 
 class VoiceSession:
-    def __init__(self, vc, text_channel):
+    def __init__(self, vc, text_channel, mode="voice"):
         self.vc, self.text_channel = vc, text_channel
+        self.mode = mode                    # "voice" (she talks, her model and voice loaded) or "music" (only hearing; see music_mode.py)
+        self.music = None
+        self.stt_engine = None              # None = the engine in voice_config.json; music mode uses its own, which runs on the CPU
+        if mode == "music":
+            import music_mode
+            gid = vc.guild.id
+            self.stt_engine = music_mode.cfg()["stt_engine"]
+            self.music = music_mode.Controller(self, env, log, leave=lambda: disconnect_session(gid), to_voice=lambda: switch_mode(gid, "voice"))
         self.loop = asyncio.get_running_loop()
         self.hid = vc.channel.id            # her chat history for this call
         self.lock = threading.Lock()
@@ -605,11 +613,12 @@ class VoiceSession:
         while True:
             await asyncio.sleep(0.1)
             cfg = load_config()["listen"]
+            silence = self.music.silence_seconds() if self.music else cfg["silence_seconds"]  # music mode waits less: its lines are short commands
             now = time.monotonic()
             done = []
             with self.lock:
                 for uid, b in list(self.bufs.items()):
-                    if now - b["last"] >= cfg["silence_seconds"] or now - b["first"] >= cfg["max_utterance_seconds"]:
+                    if now - b["last"] >= silence or now - b["first"] >= cfg["max_utterance_seconds"]:
                         done.append(self.bufs.pop(uid))
             for b in done:
                 seconds = len(b["pcm"]) / (48000 * 4)
@@ -698,7 +707,7 @@ class VoiceSession:
         pcm_to_wav16(pcm, path)
         try:
             hints = ", ".join(dict.fromkeys(env.known_names() + cfg["stt"].get("extra_hints", [])))
-            r = await worker_call("stt", cfg["stt"]["engine"], op="transcribe", path=path, language=cfg["stt"].get("language", "auto"), hints=hints + ".")
+            r = await worker_call("stt", self.stt_engine or cfg["stt"]["engine"], op="transcribe", path=path, language=cfg["stt"].get("language", "auto"), hints=hints + ".")
             return r["text"], r.get("language"), r["seconds"]
         finally:
             if os.path.exists(path):
@@ -721,7 +730,7 @@ class VoiceSession:
         write_wav16(path, np.concatenate(parts))
         try:
             hints = ", ".join(dict.fromkeys(env.known_names() + cfg["stt"].get("extra_hints", [])))
-            r = await worker_call("stt", cfg["stt"]["engine"], op="transcribe", path=path, bounds=bounds,
+            r = await worker_call("stt", self.stt_engine or cfg["stt"]["engine"], op="transcribe", path=path, bounds=bounds,
                                   language=cfg["stt"].get("language", "auto"), hints=hints + ".")
             return r["texts"], r["seconds"]
         finally:
@@ -826,7 +835,16 @@ class VoiceSession:
                     log(f"not answering {who} again: it has talked to me {self.bot_streak} times with nobody else speaking")
                     continue
                 self.bot_streak += 1
-            if env.is_owner(user.id) and looks_like_voice_request(text) and await self._asked_to_leave(text):
+            if env.is_owner(user.id) and self.mode == "voice" and _MUSIC_MODE.search(text.lower()):  # "swap to music": an explicit phrase, by words alone, no model call
+                problem = music_problem()
+                if problem:
+                    await self._speak_aloud(problem)
+                    continue
+                log("asked to switch to music mode")
+                await self._speak_aloud("Okay, music mode.")
+                await switch_mode(self.vc.guild.id, "music")  # runs as its own task; this one is cancelled when the voice session ends
+                return
+            if env.is_owner(user.id) and asks_join_or_leave(text) and await self._asked_to_leave(text):  # (not music talk: that needs no model call)
                 return
             if getattr(env, "handle_reminder_text", None) and env.looks_like_reminder(text):
                 said = await env.handle_reminder_text(text, user.id, who, self.text_channel.id)
@@ -1105,16 +1123,21 @@ class VoiceSession:
 
     # --- lifecycle
     def start(self, sink):
+        if self.music:
+            self.music.start()  # raises if the audio cable can't be opened: the caller leaves again and says why
         self.vc.listen(sink)
         try:
             install_dave_support(self.vc)
         except Exception:
             log("couldn't add call-encryption support to the listener:" + chr(10) + traceback.format_exc())
-        self.tasks = [asyncio.create_task(self._watch()), asyncio.create_task(self._stt_loop()), asyncio.create_task(self._process_loop())]
+        self.tasks = [asyncio.create_task(self._watch()), asyncio.create_task(self._stt_loop()),
+                      asyncio.create_task(self.music.run() if self.music else self._process_loop())]
 
     async def stop(self):
         for t in self.tasks:
             t.cancel()
+        if self.music:
+            self.music.stop()
         try:
             self.vc.stop_listening()
         except Exception:
@@ -1131,7 +1154,7 @@ async def announce(user_id, text):
     """A reminder came due for someone who is in the call she is in: say it out loud as well."""
     for session in list(sessions.values()):
         members = {m.id for m in getattr(session.vc.channel, "members", [])}
-        if user_id in members and not session.speaking:
+        if user_id in members and not session.speaking and not session.music:  # music mode has no voice loaded: that reminder stays in text
             await session._speak_aloud(text)
             return
 
@@ -1153,7 +1176,7 @@ def make_sink(session):
 
 
 # ------------------------------------------------------------------ chat commands
-HELP = ("`!vc join` (join your voice channel), `!vc leave`, `!vc status`, `!vc voice <engine> [voice]`, `!vc stt <model>`, "
+HELP = ("`!vc join` (join your voice channel), `!vc music` (join in music mode: Spotify, nothing on the GPU), `!vc spotify login`, `!vc leave`, `!vc status`, `!vc voice <engine> [voice]`, `!vc stt <model>`, "
         "`!vc always on|off`, `!vc echo on|off`, `!vc hear <bot>`, `!vc timing`")
 
 
@@ -1196,32 +1219,86 @@ async def warm_up(cfg, text_channel):
         await env.send_long(text_channel, f"⚠️ Voice models failed to load: {e}")
 
 
-async def disconnect_session(gid, keep_models=False):
+async def disconnect_session(gid, keep_models=False, warm=True):
     """Leave the call in this server. Unless she is only moving to another channel, free the speech models and give her
     model's normal settings back."""
     session = sessions.pop(gid, None)
+    was_music = bool(session and session.music)
     if session:
         await session.stop()
     if not keep_models and not sessions:
         stop_workers()
+        if was_music:
+            return  # music mode never touched her model or the GPU, so there is nothing to give back
         env.set_keep_alive(None)  # back to the normal short timeout
         env.set_gpu_layers(None)  # and all of her layers back on the GPU
-        await asyncio.to_thread(env.warm_model)
+        if warm:  # (not when going to music mode: nothing should be put on the GPU then)
+            await asyncio.to_thread(env.warm_model)
         flush = getattr(env, "flush_memories", None)
         if flush:
             asyncio.create_task(flush())  # what was said in the call goes into her memories now, not ten minutes later
 
 
-async def join_call(message, reply):
-    """Join the voice channel the person is in; if she is in another channel here, move."""
+def music_problem():
+    """Why music mode can't start, or None. Its hearing must run on the CPU: the whole point is to leave the GPU alone."""
+    import music_mode
+    cfg, engine = load_config(), music_mode.cfg()["stt_engine"]
+    if engine not in cfg["engines"]:
+        return f"music_config.json names the speech engine {engine!r}, which isn't in voice_config.json."
+    if engine_entry(cfg, engine)[1].get("device", "cpu") == "cuda":
+        return f"Music mode needs speech recognition on the CPU, but {engine!r} is set to the GPU. Set stt_engine in music_config.json to a CPU one."
+    return None
+
+
+async def switch_mode(gid, mode):
+    """Stay in the same channel and change between voice and music. Returns a sentence if it can't, else None."""
+    session = sessions.get(gid)
+    if session is None:
+        return "I'm not in a call here."
+    if session.mode == mode:
+        return f"Already in {mode} mode."
+    if mode == "voice":
+        fits, why = await asyncio.to_thread(vram_guard.check, "voice")
+        if not fits:
+            return why  # she stays in music mode rather than fighting for the GPU
+    elif (why := music_problem()):
+        return why
+    # The switch runs as its own task: it is often asked for from inside this session's own listening task, and leaving the call cancels
+    # that task, which would stop the switch half way (she would leave and never come back).
+    task = asyncio.create_task(_switch(gid, mode, session.vc.channel, session.text_channel))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+    return None
+
+
+_background = set()  # keeps running tasks from being garbage-collected
+
+
+async def _switch(gid, mode, channel, text_channel):
+    say = lambda text: env.send_long(text_channel, text)
+    try:
+        await disconnect_session(gid, keep_models=(mode == "voice"), warm=(mode == "voice"))  # music -> voice keeps the hearing she loaded; voice -> music gives the GPU back
+        await _enter(channel, text_channel, mode, say)
+    except Exception as e:
+        log("couldn't switch mode:" + chr(10) + traceback.format_exc())
+        await say(f"⚠️ Couldn't switch to {mode} mode: {type(e).__name__}: {e}")
+
+
+async def join_call(message, reply, music=False):
+    """Join the voice channel the person is in (in music mode if asked); if she is in another channel here, move; if she is
+    already in this one in the other mode, switch."""
     cfg = load_config()
+    mode = "music" if music else "voice"
     gid = message.guild.id
     voice = getattr(message.author, "voice", None)
     if not voice or not voice.channel:
         return await reply("Join a voice channel first, then ask me again.")
     session = sessions.get(gid)
     if session and session.vc.channel.id == voice.channel.id:
-        return await reply("I'm already in there with you.")
+        if session.mode == mode:
+            return await reply("I'm already in there with you.")
+        problem = await switch_mode(gid, mode)
+        return await reply(problem) if problem else None
     # check the channel before touching anything, so a refused move doesn't leave her in no call at all
     channel, me = voice.channel, getattr(message.guild, "me", None)
     perms = channel.permissions_for(me) if me is not None and hasattr(channel, "permissions_for") else None
@@ -1237,23 +1314,54 @@ async def join_call(message, reply):
     except ImportError:
         return await reply(INSTALL_HELP)
     moving = session is not None
-    if not moving:  # moving between channels keeps the models she already has
+    same_mode = moving and session.mode == mode  # moving between channels in the same mode keeps the models she already has
+    if mode == "music":
+        if (why := music_problem()):
+            return await reply(why)
+    elif not same_mode:
         fits, why = await asyncio.to_thread(vram_guard.check, "voice")
         if not fits:
             return await reply(why)
     if moving:
-        await disconnect_session(gid, keep_models=True)
+        await disconnect_session(gid, keep_models=same_mode, warm=(mode == "voice"))
+    await _enter(voice.channel, message.channel, mode, reply, moved=same_mode, note=no_speak)
+
+
+async def _enter(channel, text_channel, mode, reply, moved=False, note=""):
+    """Connect to the channel and start the session in that mode."""
+    from discord.ext import voice_recv
+    cfg = load_config()
+    gid = channel.guild.id
     try:
-        vc = await voice.channel.connect(cls=voice_recv.VoiceRecvClient)
+        vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
     except Exception as e:
         return await reply(f"⚠️ Couldn't join: {type(e).__name__}: {e}")
-    session = sessions[gid] = VoiceSession(vc, message.channel)
-    env.set_keep_alive(VOICE_KEEP_ALIVE)  # her model stays loaded until she leaves
-    env.set_gpu_layers(cfg.get("call", {}).get("sera_gpu_layers"))  # fewer of her layers on the GPU, so a GPU voice fits beside her
-    session.start(make_sink(session))
-    await reply(f"🎙️ {'Moved to' if moving else 'Joined'} **{voice.channel.name}**." + ("" if moving else " Loading the voice models…") + no_speak)
-    if not moving:
-        asyncio.create_task(warm_up(cfg, message.channel))
+    session = sessions[gid] = VoiceSession(vc, text_channel, mode)
+    if mode == "voice":
+        env.set_keep_alive(VOICE_KEEP_ALIVE)  # her model stays loaded until she leaves
+        env.set_gpu_layers(cfg.get("call", {}).get("sera_gpu_layers"))  # fewer of her layers on the GPU, so a GPU voice fits beside her
+    try:
+        session.start(make_sink(session))
+    except Exception as e:  # music mode: the audio cable couldn't be opened
+        sessions.pop(gid, None)
+        await vc.disconnect(force=True)
+        return await reply(f"⚠️ Couldn't start music mode: {e}")
+    if mode == "music":
+        await reply(f"🎵 Joined **{channel.name}** in music mode (hearing only, nothing on the GPU; give hearing a few seconds to load). "
+                    "Say \"hey sera, play <song>\"; \"hey sera, switch to voice\" or \"hey sera, leave\" when you're done." + note)
+        asyncio.create_task(warm_music(session, text_channel))
+        return
+    await reply(f"🎙️ {'Moved to' if moved else 'Joined'} **{channel.name}**." + ("" if moved else " Loading the voice models…") + note)
+    if not moved:
+        asyncio.create_task(warm_up(cfg, text_channel))
+
+
+async def warm_music(session, text_channel):
+    """Load speech recognition (on the CPU) now, so the first 'hey sera' isn't a long wait. Silent unless it fails."""
+    try:
+        await worker_call("stt", session.stt_engine, op="load")
+    except Exception as e:
+        await env.send_long(text_channel, f"⚠️ Speech recognition failed to load: {e}")
 
 
 async def leave_call(message, reply):
@@ -1282,9 +1390,23 @@ LEAVE_LINES = sera_home.lines("LEAVE_LINES", [
 ])
 
 
-def looks_like_voice_request(text):
+_MUSIC_WORDS = re.compile(r"\b(music|songs?|tunes?|spotify)\b")
+_MUSIC_MODE = re.compile(r"\bmusic mode\b|\b(?:switch|swap|change|go|back) (?:back )?to music\b")
+
+
+def is_music_request(text):
+    """'join vc in music mode', 'can we get some music in vc?'. Decided by words alone, with no model call: this must not wake the GPU."""
+    t = text.lower()
+    return bool((_MUSIC_MODE.search(t) or (_MUSIC_WORDS.search(t) and _PLACE_WORDS.search(t))) and not _LEAVE_WORDS.search(t))
+
+
+def asks_join_or_leave(text):
     t = text.lower()
     return bool(_PLACE_WORDS.search(t) and (_JOIN_WORDS.search(t) or _LEAVE_WORDS.search(t)))
+
+
+def looks_like_voice_request(text):
+    return is_music_request(text) or asks_join_or_leave(text)
 
 
 async def voice_intent(text):
@@ -1300,10 +1422,16 @@ async def voice_intent(text):
 
 async def handle_natural_request(message):
     """True if the message asked her to join or leave a call and she dealt with it (did it, or told them off)."""
+    reply = lambda text: message.reply(text, mention_author=False)
+    if is_music_request(message.content):
+        if not env.is_owner(message.author.id):
+            await reply(env.not_owner_line())
+        else:
+            await join_call(message, reply, music=True)
+        return True
     intent = await voice_intent(message.content)
     if not intent:
         return False
-    reply = lambda text: message.reply(text, mention_author=False)
     if not env.is_owner(message.author.id):
         await reply(env.not_owner_line())
         return True
@@ -1329,6 +1457,20 @@ async def handle_command(message):
     session = sessions.get(gid)
     if cmd == "join":
         await join_call(message, reply)
+    elif cmd == "music":
+        await join_call(message, reply, music=True)
+    elif cmd == "spotify":
+        import spotify_client
+        sub = parts[2].lower() if len(parts) > 2 else "status"
+        if sub == "login":
+            await reply("Opening the Spotify login in a browser on the PC. Approve it there (you have 3 minutes).")
+            try:
+                await asyncio.to_thread(spotify_client.login, 180, log)
+                await reply("✅ Logged in to Spotify.")
+            except spotify_client.SpotifyError as e:
+                await reply(f"⚠️ {e}")
+        else:
+            await reply("Spotify: " + ("logged in." if spotify_client.logged_in() else "not logged in yet (`!vc spotify login`)."))
     elif cmd == "leave":
         await leave_call(message, reply)
     elif cmd == "timing":
@@ -1381,7 +1523,7 @@ async def handle_command(message):
         await reply("I listen to people" + (" and to every bot." if heard == "all" else f" and to these bots: {', '.join(heard)}." if heard else ", not bots.")
                     + " `!vc hear <bot name or id>`, `!vc hear all`, `!vc hear none`.")
     elif cmd == "status":
-        where = f"in **{session.vc.channel.name}**" if session else "not in a call"
+        where = f"in **{session.vc.channel.name}** ({session.mode} mode)" if session else "not in a call"
         await reply(f"I'm {where}. Voice: **{cfg['tts']['engine']}** (Spanish: {cfg['tts'].get('non_english_engine') or 'same'}), "
                     f"hearing: **{cfg['engines'][cfg['stt']['engine']].get('options', {}).get('model', '?')}**, "
                     f"answers: {'everything' if cfg['listen']['respond_to'] == 'all' else 'when named, then a short follow-up window'}.\n{HELP}")
