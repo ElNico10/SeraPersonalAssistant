@@ -25,9 +25,11 @@ DEFAULTS = {
         "picture": 9500,         # the picture model at its peak while drawing
         "picture_idle": 5500,    # what the picture model keeps while it sits idle before it stops itself
         "coding": 9610,          # the local coding model (the rest of it sits in system RAM)
+        "edit_klein": 8900,      # the picture-editing model at its peak (see image_edit.py)
     },
     "labels": {                  # how each feature is named in what she says
         "chat": "chatting", "voice": "a voice call", "picture": "pictures", "coding": "the coding agent",
+        "edit_klein": "picture editing",
     },
 }
 
@@ -91,8 +93,8 @@ def _want(feature, c, chat_in, coding_in, pic_up):
         return (0 if chat_in else n["chat"]), (n["coding"] if coding_in else 0)
     if feature == "coding":
         return (0 if coding_in else n["coding"]), (n["chat"] if chat_in else 0)  # her chat model steps out for it
-    if feature == "picture":
-        return (0 if pic_up else n["picture"]), (n["chat"] if chat_in else 0) + (n["coding"] if coding_in else 0)
+    if feature == "picture" or feature.startswith("edit_"):
+        return (0 if pic_up else n[feature]), (n["chat"] if chat_in else 0) + (n["coding"] if coding_in else 0)
     if feature == "voice":
         back = n["coding"] if coding_in else 0
         if chat_in:  # joining reloads her model on fewer layers, which gives back the difference
@@ -116,7 +118,7 @@ def check(feature):
     chat, agent = sera_home.model("chat"), sera_home.model("agent")
     chat_in = bool(chat) and chat.split(":")[0] in names
     coding_in = bool(agent) and agent.split(":")[0] in names
-    need, reclaim = _want(feature, c, chat_in, coding_in, picture_model_up() if feature == "picture" else False)
+    need, reclaim = _want(feature, c, chat_in, coding_in, picture_model_up() if feature == "picture" or feature.startswith("edit_") else False)
     total, used = gpu
     if need == 0 or total - used + reclaim >= need + c["headroom_mb"]:
         return True, ""

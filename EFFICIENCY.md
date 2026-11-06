@@ -61,3 +61,18 @@ Settings live in `efficiency_config.json` (re-read when the file changes). Code:
 ## Pings (@Name in her own replies)
 
 When she writes `@Name` in a reply, `add_mentions` turns it into a real Discord ping if Name is exactly someone's Discord name (the `name` in people.json; capitals don't matter; names with spaces work). It never resolves a nickname she gave someone (an `@Sam` stays text if Sam is only what she calls the owner), never a part of a name, never `@everyone`, `@here` or a role, never inside code or a quoted line, never the person she is answering (the reply already notifies them), and only `mention_limit` (2) per message; a name two people share is skipped. Only her own words go through it (her replies, the hand-off announcement, and lines she types in the chat from a voice call, owner only): tool output, files and agent reports never do. Her notes now show `Sam (Discord name: samuel_99)` and tell her to ping with the Discord name, never a nickname. `mention_names: false` in `efficiency_config.json` turns it off.
+
+## Saved conversations (`conversations.py`)
+
+What a long chat's history cuts off is no longer lost. It is set aside on disk first, then filed under the subject it was about, in
+`<workspace>/conversations/` (her file tools can't reach that folder, and only this code writes it):
+
+- `regex-parser.md`: a readable summary and a list of decisions and open items (the version it replaced is kept as `regex-parser.prev.md`).
+- `regex-parser.log`: the messages themselves, add-only. A bad summary can always be rebuilt from it.
+
+After her answer, the model says which saved conversation the cut-off messages carry on (or names a new one, two to five words) and rewrites
+that summary. The chat's current conversation has its summary in her notes, so it survives the cut. The same call that checks whether a
+message is for her also says whether it has moved to a different subject: then the summary stops riding along, and if the chat is at least
+`leave_min_messages` long its older part is filed at once. Her notes list the saved subjects by name; the tools `find_conversation` and
+`open_conversation` bring one back, from any chat she may show it in (the same rules as her history search: the same server, and only
+channels the person can read; the owner sees all). `"save_conversations": false` turns it off. To get rid of one, delete its files by hand.

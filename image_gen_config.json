@@ -35,5 +35,35 @@
     },
     "avoid": "",
     "block_nudity": true
+  },
+  "edit": {
+    "_help": "Editing a picture from an instruction (!image edit). ceiling_mb: the edit is stopped if the card's used memory passes it (the card has 12288 MiB). default: which model when none is named. (Qwen-Image-Edit was tried and removed: Q4 made anatomy errors.)",
+    "default": "klein",
+    "ceiling_mb": 11800,
+    "models": {
+      "klein": {
+        "unet": "flux-2-klein-4b.safetensors",
+        "clip": "qwen_3_4b.safetensors",
+        "vae": "flux2-vae.safetensors",
+        "steps": 4,
+        "max_steps": 12,
+        "cfg": 1.0,
+        "megapixels": 1.0,
+        "files": [
+          [
+            "diffusion_models",
+            "flux-2-klein-4b.safetensors"
+          ],
+          [
+            "text_encoders",
+            "qwen_3_4b.safetensors"
+          ],
+          [
+            "vae",
+            "flux2-vae.safetensors"
+          ]
+        ]
+      }
+    }
   }
 }

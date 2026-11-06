@@ -16,6 +16,8 @@ DEFAULTS = {
     "max_entries": 300, "max_entry_chars": 60000,
     "mention_names": True,         # "@Name" in her own replies becomes a real ping when Name is exactly someone's Discord name
     "mention_limit": 2,            # at most this many pings in one message
+    "save_conversations": True,    # what a long history cuts off is filed under the subject it was about (see conversations.py)
+    "leave_min_messages": 6,       # when a chat moves to another subject, the older part is filed at once, if there are at least this many messages
 }
 STUB_START = "[Saved to your notebook as #"
 SPEAKER = re.compile(r"^\[[^\]\n]{1,40}\]:\s*")
@@ -136,13 +138,17 @@ def age_out(cid, hist, notes_tag=""):
 
 
 def trim(hist):
-    """Cut an over-long history down in one step, not by one message every turn, so what stays keeps the same start."""
+    """Cut an over-long history down in one step, not by one message every turn, so what stays keeps the same start.
+    Returns the messages that were cut (empty if none), so they can be saved instead of lost."""
     c = cfg()
     if len(hist) > c["trim_at"] + 1:
         keep = hist[-c["trim_to"]:]
         while keep and _get(keep[0], "role") == "tool":  # a tool answer without the call that asked for it confuses her
             keep.pop(0)
+        cut = hist[1:len(hist) - len(keep)]
         hist[:] = [hist[0]] + keep
+        return cut
+    return []
 
 
 def look_back(cid, entry=0, offset=0):

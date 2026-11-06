@@ -21,11 +21,13 @@ import mood
 import memory
 import message_log
 import notebook
+import conversations
 import sera_home
 import claude_sessions
 import reminders
 import web_ui
 import image_gen
+import image_edit
 import image_safety
 import vram_guard
 from dotenv import load_dotenv
@@ -428,8 +430,9 @@ AGENT_MAX_TOKENS = 12000  # ollama backend only: per call, thinking included; af
 AGENT_THINK_TOKENS = 6000
 PLAN_TOKENS = 3000   # thinking and plan together: more than this and the planner is going round in circles
 MEDIC_TOKENS = 1500  # same for the recovery step after a failed tool
+STEP_SECONDS = 300   # the longest one written answer may take; it is stopped there (and what she had written is sent), not left running behind the next call
 # Tools whose ❌ is an answer, not a mistake to fix (nothing found, not allowed, no room, stopped): the recovery step can only make things worse there
-NO_MEDIC = ('look_back', 'look_at_agent_work', 'fetch_old_image', 'search_chat_history', 'delegate_task', 'cancel_job', 'generate_image', 'check_jobs')
+NO_MEDIC = ('look_back', 'find_conversation', 'open_conversation', 'look_at_agent_work', 'fetch_old_image', 'search_chat_history', 'delegate_task', 'cancel_job', 'generate_image', 'check_jobs')
 QUESTION_ANSWER_CHARS = 3000  # how much of a question's answer Sera reads to introduce it; the user gets all of it
 MAX_ATTEMPTS = 3          # total agent runs per job; Sera sends it back when her review fails it
 
@@ -1383,7 +1386,17 @@ def refresh_notes(channel_id, related=''):
     always = memory.pinned_text()
     earlier = memory.recall_text(_recent_user_text(channel_id), [nickname_of(i, '') for i in ids])
     due_soon = reminders.notes_for(ids)
+    here, saved = '', ''
+    if notebook.cfg()['save_conversations']:
+        try:
+            scope = conversation_scope()
+            here, saved = conversations.active_block(channel_id, *scope), conversations.index(*scope, channel_id=channel_id)
+        except Exception as e:
+            print(f"⚠️ couldn't read the saved conversations: {e}")
     parts = [t for t in (f"Always true:\n{always}" if always else '',
+                         here,
+                         f"Conversations you saved earlier (when people return to one of these subjects, open_conversation brings it back; "
+                         f"find_conversation searches them): {saved}" if saved else '',
                          f"Reminders you are holding (the exact wording and time; never change them):\n{due_soon}" if due_soon else '',
                          f"How you feel:\n{feelings}" if feelings else '',
                          f"What you remember from earlier chats:\n{earlier}" if earlier else '',
@@ -1504,6 +1517,47 @@ def auto_history(message):
     rows, since_text = message_log.search(message.guild.id, words, None, days, None, None,
                                           readable_channels(message.guild, message.author, is_owner(message.author.id)), exclude_id=message.id)
     return message_log.render(rows, since_text, message.guild.name) if rows else ''
+
+def conversation_ask(prompt, schema, tokens):
+    """One answer from her model as JSON, for filing conversations."""
+    r = ollama.chat(model=MODEL_NAME, messages=[{'role': 'user', 'content': prompt}], format=schema, think=False, keep_alive=KEEP_ALIVE,
+                    options=ollama_options(temperature=0, num_predict=tokens))
+    return json.loads(r.message.content)
+
+conversations.init(SimpleNamespace(dir=os.path.join(SECURE_BOT_DIRECTORY, 'conversations'), notes_tag=NOTES_TAG, ask=conversation_ask))  # not reachable by her file tools (they only see the top of the workspace)
+
+def conversation_scope():
+    """Which saved conversations the person talking to her may see: (server id, or None for any; channel ids they can read, or None for all)."""
+    if is_owner(current['user_id']):
+        return None, None
+    gid = current.get('guild_id')
+    return gid or 0, readable_channels(client.get_guild(gid) if gid else None, current.get('asker'), False)
+
+def find_conversation(query='', words=''):
+    return conversations.find(query or words, *conversation_scope())
+
+def open_conversation(title='', name=''):
+    return conversations.open_topic(title or name, current['channel_id'], *conversation_scope())
+
+find_conversation_tool = {
+    'type': 'function',
+    'function': {
+        'name': 'find_conversation',
+        'description': 'Look for a conversation you saved earlier about a subject people were working on or talking through (like a regex parser). '
+                       'Give a few words about the subject. You get the names that fit; open one with open_conversation.',
+        'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}
+    }
+}
+
+open_conversation_tool = {
+    'type': 'function',
+    'function': {
+        'name': 'open_conversation',
+        'description': 'Bring back a conversation you saved earlier, by its name, to carry on where it stopped. Use it when someone returns to a '
+                       'subject whose name is in your notes of saved conversations, instead of starting over or guessing what was said.',
+        'parameters': {'type': 'object', 'properties': {'title': {'type': 'string'}}, 'required': ['title']}
+    }
+}
 
 fetch_image_tool = {
     'type': 'function',
@@ -1728,6 +1782,8 @@ look_at_agent_work_tool = {
 # Add new tools here (plus their schema) and every tool call site picks them up.
 TOOL_FUNCS = {
     'look_back': look_back,
+    'find_conversation': find_conversation,
+    'open_conversation': open_conversation,
     'search_chat_history': search_chat_history,
     'fetch_old_image': fetch_old_image,
     'look_at_agent_work': look_at_agent_work,
@@ -1799,15 +1855,21 @@ def _is_looping(text):
     """True when the end of the text has already appeared at least twice before: it is going round in circles."""
     return len(text) > 3000 and text.count(text[-300:]) >= 3
 
-def chat_streamed(label='💭', **kwargs):
-    """ollama.chat that prints her thinking and her answer to the console as they arrive, then returns the assembled reply."""
+def chat_streamed(label='💭', max_seconds=None, **kwargs):
+    """ollama.chat that prints her thinking and her answer to the console as they arrive, then returns the assembled reply.
+    max_seconds: stop a call that runs longer than this (done_reason 'timeout', what came so far is kept); the request is closed, so Ollama stops too."""
     kwargs.pop('stream', None)
     content, thinking, tool_calls, mode, done_reason = '', '', [], None, None
     prompt_tokens = out_tokens = None
     stream = _ollama_client.chat(stream=True, **kwargs)
     checked = 0
+    started = time.time()
     try:
         for chunk in stream:
+            if max_seconds and time.time() - started > max_seconds:
+                print(f"\n⏱️ Still going after {max_seconds}s; stopping this call.", flush=True)
+                done_reason = 'timeout'
+                break
             m = chunk.message
             if len(thinking) - checked >= 1500:  # a model stuck saying the same thing over: stop it, don't wait for the token cap
                 checked = len(thinking)
@@ -1935,27 +1997,34 @@ CODE_WORDS = re.compile(r"\b(fix|run|build|write|make|create|debug|review|change
 TRIAGE_SCHEMA = {"type": "object", "properties": {"for_you": {"type": "string", "enum": ["DIRECT", "ABOUT"]},
                                                   "kind": {"type": "string", "enum": ["CHAT", "PLAN", "CODE"]}},
                  "required": ["for_you", "kind"]}
-_triage_cache = {}  # message text -> (DIRECT or ABOUT, CHAT or PLAN or CODE): filled by one call, read by the checks below
+TRIAGE_TOPIC_SCHEMA = {"type": "object", "properties": {**TRIAGE_SCHEMA["properties"], "on_topic": {"type": "string", "enum": ["SAME", "NEW"]}},
+                       "required": ["for_you", "kind", "on_topic"]}
+_triage_cache = {}  # message text -> (DIRECT or ABOUT, CHAT or PLAN or CODE, SAME or NEW): filled by one call, read by the checks below
 
-def triage(text, intent_question=None):
+def triage(text, intent_question=None, topic=None):
     """One call that answers what three separate ones used to: is it for her (only when intent_question is given), and is it plain
-    chat, a job needing a plan, or code. Returns (for_you, kind), or None when it can't tell: the separate checks then run as before."""
+    chat, a job needing a plan, or code. topic: the saved conversation this chat is in; the same call also says whether the message
+    has moved on to a different subject (SAME or NEW, always SAME without a topic).
+    Returns (for_you, kind, on_topic), or None when it can't tell: the separate checks then run as before."""
     _triage_cache.pop(text, None)
     if not notebook.cfg()['merged_triage']:
         return None
     prompt = ((intent_question + chr(10)) if intent_question else "") + (
+        f"The chat has been about the saved conversation '{topic}'. Also give on_topic: SAME if the message still belongs to that subject "
+        "(a follow-up, an answer, a detail or a short reply to it), NEW if it moves to a different subject. " if topic else "") + (
         "Also decide the kind of the message. CODE: asks for a program, script, tool, app or game to be written, fixed, changed, reviewed "
         "or run, or about one specific program or file of theirs. General programming questions, concepts, opinions, casual chat and short "
         "vague replies such as 'what', 'huh', 'why' or 'ok' are NOT code, and neither is asking to look at, list or check files that already exist "
         "(for example in the agents' folder). PLAN: asks for several things at once, a long structured answer "
         "such as a study guide or lesson, or work with files or tools. CHAT: everything else, such as a simple question, a quick "
         "explanation, an opinion, a greeting or casual talk. "
-        f"Message: '{text.replace(chr(39), '')[:600]}'. Answer for_you (DIRECT or ABOUT; DIRECT if no question about that was asked) and kind.")
+        f"Message: '{text.replace(chr(39), '')[:600]}'. Answer for_you (DIRECT or ABOUT; DIRECT if no question about that was asked) and kind" + (" and on_topic." if topic else "."))
     try:
-        r = ollama.chat(model=MODEL_NAME, messages=[{'role': 'user', 'content': prompt}], format=TRIAGE_SCHEMA, think=False,
-                        keep_alive=KEEP_ALIVE, options=ollama_options(temperature=0, num_predict=40))
+        r = ollama.chat(model=MODEL_NAME, messages=[{'role': 'user', 'content': prompt}], format=TRIAGE_TOPIC_SCHEMA if topic else TRIAGE_SCHEMA,
+                        think=False, keep_alive=KEEP_ALIVE, options=ollama_options(temperature=0, num_predict=60))
         data = json.loads(r.message.content)
         for_you, kind = str(data['for_you']).upper(), str(data['kind']).upper()
+        on_topic = 'NEW' if str(data.get('on_topic', 'SAME')).upper() == 'NEW' else 'SAME'
         if for_you not in ('DIRECT', 'ABOUT') or kind not in ('CHAT', 'PLAN', 'CODE'):
             return None
     except Exception as e:
@@ -1965,7 +2034,7 @@ def triage(text, intent_question=None):
         kind = 'CHAT'  # "what", "huh", "ok": nothing to build or fix
     if len(_triage_cache) >= 16:
         _triage_cache.pop(next(iter(_triage_cache)))
-    _triage_cache[text] = (for_you, kind)
+    _triage_cache[text] = (for_you, kind, on_topic)
     return _triage_cache[text]
 
 def wants_code(text):
@@ -1997,6 +2066,37 @@ def named(message):
     """The message as she sees it in her history: who said it, then what, with @mentions turned into names."""
     who = nickname_of(message.author.id, message.author.display_name).replace(']', ')').replace(chr(10), ' ')[:40]
     return f"[{who}]: {message.clean_content}"
+
+_context = {}  # message id -> what was said in the channel just before it: read once for the intent check, then for the answer
+
+async def channel_context(message, limit=10):
+    """What people wrote in this channel since her last message, oldest first, in the form her history uses. It wasn't said to her, so she
+    never saw it: without it "sera, thoughts?" has nothing to be about, and she can't tell two other people talking from a question to her."""
+    if message.guild is None or getattr(message, 'is_web', False):
+        return []
+    lines = []
+    try:
+        async for m in message.channel.history(limit=limit, before=message):  # newest first
+            if m.author == client.user:
+                break
+            if not m.author.bot and m.clean_content.strip():
+                lines.append(named(m)[:300])
+    except discord.HTTPException as e:
+        print(f"⚠️ couldn't read the recent messages in the channel: {e}")
+    return lines[::-1]
+
+def intent_question(message, used_name, follow_up, context):
+    """What the intent check is asked: the chat just before, who wrote the message, and who it @mentions (by name: the raw text only has ID numbers)."""
+    others = [m.display_name for m in message.mentions if m != client.user]
+    who = message.author.display_name
+    q = ("Recent chat, oldest first:\n" + "\n".join(l[:200] for l in context[-6:]) + "\n") if context else ""
+    if follow_up:
+        q += f"{used_name} last said: '{last_said(message.channel.id)[:300]}'.\n"
+    q += f"Latest message, written by {who}: '{message.clean_content}'. "
+    if others:
+        q += f"It @mentions {', '.join(others)}" + ("" if client.user in message.mentions else f" and not {used_name}") + ". "
+    return q + (f"Is {who} speaking to {used_name} (DIRECT)? Answer ABOUT if it is meant for someone else, answers or continues a conversation "
+                f"between other people, or only talks about {used_name} without speaking to them.")
 
 def new_addr(message_id, user_id):
     """Who one answer is for: send_long addresses the first message it sends with this, once."""
@@ -2122,6 +2222,7 @@ def help_text(owner):
                 "or \"my reminders\". `!image examples` shows what the picture maker can do, if it's switched on. Everything else with a `!` is for my owner.")
     tiers = list(agent_cfg()['claude_models']) or ['model name']  # the tier names are whatever models.json says
     return ("**Commands** (all yours; `!help` shows this)\n"
+            "**Restart:** `!update` (checks her code compiles, then restarts her with the current code)\n"
             "**Coding agent:** `!agent` (status), `!agent claude`, `!agent local`, `!agent model " + "|".join(tiers) + "|auto`, `!agent effort low|medium|high|xhigh|max|auto`, `!agent stop [job number]` (give up on a job: no retries, no report). "
             "You can also say it in a message: \"use " + tiers[0] + " on low effort\".\n"
             f"**Voice calls:** {voice_chat.HELP}\n"
@@ -2139,6 +2240,31 @@ def help_text(owner):
 
 async def handle_help_command(message):
     await message.reply(help_text(is_owner(message.author.id)), mention_author=False)
+
+# Waits for the old process to be gone (so the Discord login, web port and GPU are free), then starts the bot again in its own console.
+# argv: old pid, then the command to run. It inherits the bot's folder.
+RESTART_HELPER = ("import ctypes,subprocess,sys;k=ctypes.windll.kernel32;h=k.OpenProcess(0x100000,0,int(sys.argv[1]));"
+                  "h and k.WaitForSingleObject(h,30000);subprocess.Popen(sys.argv[2:],creationflags=0x10)")
+
+async def handle_update_command(message):
+    """!update: owner only. Refuses if any of her code no longer compiles (a broken restart would leave her dead and you away from the PC),
+    otherwise closes her, kills the process and starts a fresh one."""
+    if not is_owner(message.author.id):
+        return await message.reply("Only my owner can restart me.", mention_author=False)
+    here = os.path.dirname(os.path.abspath(__file__))
+    import py_compile
+    for f in sorted(Path(here).glob('*.py')):
+        try:
+            py_compile.compile(str(f), cfile=os.devnull, doraise=True)
+        except py_compile.PyCompileError as e:
+            return await message.reply(f"❌ Not restarting: `{f.name}` doesn't compile, so I'd come back dead.\n```{str(e)[-1200:]}```", mention_author=False)
+    await message.reply("🔄 Restarting with the current code. Back in about a minute.", mention_author=False)
+    subprocess.Popen([sys.executable, '-c', RESTART_HELPER, str(os.getpid()), sys.executable, *sys.argv], cwd=here, creationflags=0x00000010)
+    try:
+        await asyncio.wait_for(client.close(), 5)
+    except Exception:
+        pass
+    os._exit(0)
 
 def agent_status_text():
     cfg = agent_cfg()
@@ -2302,7 +2428,7 @@ async def _memory_loop():
             print(f"⚠️ memory pass failed:\n{traceback.format_exc()}")
 
 IMAGE_SIZES = {'square': (1024, 1024), 'portrait': (832, 1216), 'landscape': (1216, 832)}
-IMAGE_HELP = ("`!image <what to draw>`, optional `--portrait` / `--landscape` / `--square`, `--seed <n>`, `--steps <n>`. "
+IMAGE_HELP = ("`!image edit ...` changes a picture you attach (`!image edit` shows how). `!image <what to draw>`, optional `--portrait` / `--landscape` / `--square`, `--seed <n>`, `--steps <n>`. "
               "`!image examples` shows pictures with the prompts that made them. Takes about a minute and she can't answer while she draws. "
               "Owner: `!image on|off` switches it for Discord, `!image safety on|off` the avoid checks.")
 
@@ -2369,6 +2495,8 @@ async def handle_image_command(message):
     settings = image_gen.cfg().get('discord', {})
     if not owner and settings.get('owner_only', True):
         return await reply(not_owner_line())
+    if arg.lower().split()[:1] == ['edit']:
+        return await handle_image_edit(message, arg[4:].strip())
     if not image_gen.available():
         return await reply("The picture model isn't set up (models.json, see the README).")
     prompt, opts = parse_image_request(arg)
@@ -2395,6 +2523,42 @@ async def handle_image_command(message):
         await post_picture(message, made['path'], f"seed {made['seed']}, {made['width']}x{made['height']}, {made['seconds']:.0f}s")
     finally:
         image_waiting[0] -= 1
+
+EDIT_HELP = ("`!image edit <what to change>` with a picture attached (or replying to a message that has one). "
+             "Owner only: I check your words, not the picture itself.")
+
+async def handle_image_edit(message, arg):
+    reply = lambda t: message.reply(t, mention_author=False)
+    if not is_owner(message.author.id):
+        return await reply(not_owner_line())  # the reference picture isn't scanned, so only the owner may
+    model = None
+    words = arg.split(None, 1)
+    if words and words[0].lower() in image_edit.GRAPHS:
+        model, arg = words[0].lower(), (words[1] if len(words) > 1 else "")
+    if not image_edit.names():
+        return await reply("No editing model is set up (see `edit` in image_gen_config.json).")
+    if not arg:
+        return await reply(EDIT_HELP + " Ready: " + ", ".join(image_edit.names()) + ".")
+    ref = message.reference.resolved if message.reference and isinstance(message.reference.resolved, discord.Message) else None
+    att = next((a for m in (message, ref) if m for a in m.attachments if (a.content_type or "").startswith("image/")), None)
+    if att is None or att.size > 15_000_000:
+        return await reply("Attach the picture to edit (under 15 MB), or reply to a message that has one. " + EDIT_HELP)
+    import tempfile
+    src = os.path.join(tempfile.mkdtemp(prefix="sera-edit-"), "ref" + (os.path.splitext(att.filename)[1] or ".png"))
+    await att.save(src)
+    try:
+        await reply("Editing it. This takes a minute or two, and I can't talk while I do.")
+        async with MODEL_LOCK:
+            async with message.channel.typing():
+                try:
+                    made = await asyncio.to_thread(image_edit.edit, arg[:2000], src, model)
+                except image_safety.Refused as e:
+                    return await reply(str(e))
+                except Exception as e:
+                    return await reply(f"Couldn't edit it: {e}")
+        await post_picture(message, made['path'], f"{made['model']}, seed {made['seed']}, {made['seconds']:.0f}s, peak {made['peak_mb']} MiB")
+    finally:
+        shutil.rmtree(os.path.dirname(src), ignore_errors=True)
 
 async def handle_history_command(message):
     """!history forget mine | <message id> | from <user id>: erase from her message log. Who may is the who_can_forget setting."""
@@ -2549,9 +2713,10 @@ async def on_ready():
 
 
 QUEUE_LIMIT, PER_USER_QUEUE = 4, 2  # requests she holds at once (one running), and from one person
+INTENT_LIMIT = 8                     # messages waiting to be checked for being hers, before the rest are dropped
 BOT_STREAK_LIMIT = 6                 # replies to bots in a row, with no human writing in between, before she lets it go
 MAX_ATTACHMENT_BYTES, MAX_PDF_BYTES, MAX_ATTACHMENT_CHARS = 100 * 1024 * 1024, 30 * 1024 * 1024, 60000
-waiting = {'all': 0, 'by': {}}
+waiting = {'all': 0, 'by': {}, 'intent': 0}
 bot_streak = {}
 
 # Said straight, no model call: she is busy, or a stranger has DMed her
@@ -2573,7 +2738,7 @@ def cap_text(text):
     return text if len(text) <= MAX_ATTACHMENT_CHARS else text[:MAX_ATTACHMENT_CHARS] + "\n[... the rest of the file was cut ...]"
 
 OTHER_BOT_COMMAND = re.compile(r"[!/?.$%&~;=+\-][a-z]", re.I)  # "!play x", "/skip", ".help", "?rank", "-p song"
-HER_COMMANDS = re.compile(r"!(remind|memory|mood|vc|image)\b", re.I)
+HER_COMMANDS = re.compile(r"!(remind|memory|mood|vc|image|update)\b", re.I)
 SPOKEN_TO_SOMEONE = re.compile(r"^\W*(?:(?:yo|hey|hi|hello|oi|ay|ok|okay)\W+)?([A-Za-z][\w'-]*)\s*[,:]")  # "Alex, join vc", "yo Mara: ..."
 
 def meant_for_someone_else(message):
@@ -2584,6 +2749,8 @@ def meant_for_someone_else(message):
         return True
     if re.match(r"<@[!&]?\d+>", text) and client.user not in message.mentions:
         return True
+    if message.mentions and client.user not in message.mentions:
+        return True  # it pings someone else somewhere in it ("what do you think @Alex?") and not her
     ref = message.reference.resolved if message.reference else None
     if isinstance(ref, discord.Message) and ref.author != client.user:
         return True
@@ -2600,6 +2767,56 @@ def message_hint(message):
     return (named_here,
             isinstance(ref, discord.Message) and ref.author == client.user,
             bool(session and time.time() - session['last_activity'] < SESSION_SECONDS and (named_here or not meant_for_someone_else(message))))
+
+async def addressed_to_her(message):
+    """True if she should answer this message: the intent check. It runs before she takes a place in line for an answer, so chat that
+    isn't hers never fills the line and never gets "one thing at a time". Call it holding MODEL_LOCK (it may use the model)."""
+    channel_id, user_id = message.channel.id, message.author.id
+    has_name_trigger, is_reply_to_bot, is_active_session = message_hint(message)
+    in_dm = message.guild is None or getattr(message, 'is_web', False)  # only the owner's DMs (and the web page) get here; all of it is for her
+    if not (has_name_trigger or is_reply_to_bot or is_active_session or in_dm):
+        return False
+    print(f"📨 [Seen in #{getattr(message.channel, 'name', 'DM')}] {message.author.name}: {message.content}")
+    context = await channel_context(message)
+    if is_reply_to_bot or in_dm:
+        verdict = 'DIRECT'  # a Discord reply to one of her messages, or a DM, is addressed to her
+    else:
+        used_name = next((t for t in BOT_TRIGGERS if re.search(rf"\b{t}\b", message.content.lower())), BOT_TRIGGERS[0])
+        question = intent_question(message, used_name, is_active_session and not has_name_trigger, context)
+        try:
+            tri = await asyncio.to_thread(triage, message.content, question, conversations.active_title(channel_id))
+            verdict = tri[0] if tri else await asyncio.to_thread(classify, question + " Reply with 1 word: DIRECT or ABOUT.", ('DIRECT', 'ABOUT'))
+        except Exception as e:
+            print(f"⚠️ Intent Error: {e}")
+            return False
+        if verdict is None and is_active_session:
+            verdict = 'DIRECT'  # mid-conversation, an unreadable check shouldn't make her go quiet
+    if verdict is None:
+        print("⚠️ Intent unclear after retries; staying quiet.")
+        return False
+    if verdict == 'ABOUT':
+        active_sessions.pop((channel_id, user_id), None)
+        return False
+    if len(_context) >= 16:
+        _context.pop(next(iter(_context)))
+    _context[message.id] = context
+    return True
+
+REPEAT_SECONDS = 90
+last_text = {}  # (channel id, user id) -> (what they wrote, when)
+
+def is_repeat(message):
+    """True if someone other than the owner sends the same text again within REPEAT_SECONDS: she answers it once, not once per copy.
+    Each copy restarts the clock, so going on sending it keeps it quiet."""
+    if is_owner(message.author.id) or message.attachments:
+        return False
+    norm = " ".join(re.sub(r"[^\w\s]", "", message.content.lower()).split())
+    key, now = (message.channel.id, message.author.id), time.time()
+    before = last_text.get(key)
+    if len(last_text) > 200:
+        last_text.clear()
+    last_text[key] = (norm, now)
+    return len(norm) >= 4 and bool(before) and before[0] == norm and now - before[1] < REPEAT_SECONDS
 
 async def dm_brush_off(message):
     """A stranger's DM gets one rude line, and after that she never answers their DMs again."""
@@ -2659,6 +2876,9 @@ async def on_message(message):
     uid = message.author.id
     if mood.is_ignored(uid):
         return  # she is ignoring this person right now; the owner can never be ignored
+    if re.match(r"!update\b", message.content.strip().lower()):
+        await handle_update_command(message)  # works in DMs too, so it can be sent from a phone
+        return
     if message.guild is not None and re.match(r"!remind\b", message.content.strip().lower()):
         await handle_remind_command(message)
         return
@@ -2714,6 +2934,16 @@ async def on_message(message):
         bot_streak[message.channel.id] = bot_streak.get(message.channel.id, 0) + 1
         if bot_streak[message.channel.id] > BOT_STREAK_LIMIT:
             return
+    if not is_owner(uid) and (is_repeat(message) or waiting['intent'] >= INTENT_LIMIT):
+        return  # the same text again, or too many unchecked messages waiting: dropped, no reply (they may not even be hers)
+    waiting['intent'] += 1
+    try:
+        async with MODEL_LOCK:  # the check may use the model, which an answer in progress holds
+            wanted = await addressed_to_her(message)
+    finally:
+        waiting['intent'] -= 1
+    if not wanted:
+        return  # not for her: it took no place in line and gets no "one thing at a time"
     if not is_owner(uid) and (waiting['all'] >= QUEUE_LIMIT or waiting['by'].get(uid, 0) >= PER_USER_QUEUE):
         if not message.author.bot:  # never trade insults with a bot
             try:
@@ -2811,47 +3041,13 @@ async def save_images(message, anyone=False):
     return saved
 
 async def handle_message(message):
+    """Answers a message that addressed_to_her() accepted."""
     if message.author == client.user:
         return
 
     channel_id = message.channel.id
     user_id = message.author.id
-    current_time = time.time()
-    
-    # her name as a whole word ("serious" is not her), or an @mention
-    has_name_trigger, is_reply_to_bot, is_active_session = message_hint(message)
-    in_dm = message.guild is None or getattr(message, 'is_web', False)  # only the owner's DMs (and the web page) get here; all of it is for her
-
-    if not (has_name_trigger or is_reply_to_bot or is_active_session or in_dm):
-        return
-
-    print(f"📨 [Seen in #{getattr(message.channel, 'name', 'DM')}] {message.author.name}: {message.content}")
-    used_name = next((t for t in BOT_TRIGGERS if re.search(rf"\b{t}\b", message.content.lower())), BOT_TRIGGERS[0])
-
-    if is_reply_to_bot or in_dm:
-        verdict = 'DIRECT'  # a Discord reply to one of her messages, or a DM, is addressed to her
-    else:
-        if is_active_session and not has_name_trigger:
-            # no name to go on, so show her last line: "what about X?" only makes sense as a follow-up to it
-            intent_prompt = (f"{used_name} just said: '{last_said(channel_id)[:300]}'. The user then wrote: '{message.content}'. "
-                             f"Is the user continuing the conversation with {used_name} (DIRECT), or talking about "
-                             f"something else or to someone else (ABOUT)? Reply with 1 word: DIRECT or ABOUT.")
-        else:
-            intent_prompt = f"Is the user talking DIRECTLY to '{used_name}' or ABOUT them/shifting topic? Message: '{message.content}'. Reply with 1 word: DIRECT or ABOUT."
-        try:
-            tri = await asyncio.to_thread(triage, message.content, intent_prompt.replace(" Reply with 1 word: DIRECT or ABOUT.", ""))
-            verdict = tri[0] if tri else await asyncio.to_thread(classify, intent_prompt, ('DIRECT', 'ABOUT'))
-        except Exception as e:
-            print(f"⚠️ Intent Error: {e}")
-            return
-        if verdict is None and is_active_session:
-            verdict = 'DIRECT'  # mid-conversation, an unreadable check shouldn't make her go quiet
-    if verdict is None:
-        print("⚠️ Intent unclear after retries; staying quiet.")
-        return
-    if verdict == 'ABOUT':
-        active_sessions.pop((channel_id, user_id), None)
-        return
+    context = _context.pop(message.id, [])  # what was said in the channel since her last message, which she wasn't part of
     keep_session(channel_id, user_id)
     current.update(images=await save_images(message), image_missing=False, guild_id=message.guild.id if message.guild else None, asker=message.author, channel_id=channel_id, user_id=user_id, message_id=message.id, difficulty=None, model_pref=asked_model(message.content), effort_pref=asked_effort(message.content))
     await asyncio.to_thread(note_person, user_id, message.author.display_name, message.author.bot)
@@ -2868,7 +3064,7 @@ async def handle_message(message):
             is_code = False
         else:
             if message.content not in _triage_cache:  # a reply to her or a DM skipped the intent step, so the combined check hasn't run yet
-                await asyncio.to_thread(triage, message.content)
+                await asyncio.to_thread(triage, message.content, None, conversations.active_title(channel_id))
             is_code = await asyncio.to_thread(wants_code, message.content)
     except Exception as e:
         print(f"⚠️ Code-request check failed: {e}")
@@ -2953,8 +3149,22 @@ async def handle_message(message):
         n = notebook.put(channel_id, 'file', f"a file from {message.author.display_name}", extra)
         shrunk = user_message['content'][:base_len] + "\n\n" + notebook.stub(n, 'file', 'attachment', extra)
 
+    if context:  # for this answer only: afterwards the chat keeps just their own line (the restore at the end uses `shrunk`)
+        shrunk = shrunk or user_message['content']
+        user_message['content'] = ("[Written in the channel just before this, not to you, so you know what they are talking about:\n"
+                                   + "\n".join(context) + "]\n\n" + user_message['content'])
+
+    old_topic = None
+    cached = _triage_cache.get(message.content)
+    if notebook.cfg()['save_conversations'] and cached and cached[2] == 'NEW' and conversations.active_slug(channel_id):
+        # the subject has moved on: the saved summary stops riding along, and once she has answered, the older part of the chat is filed under it
+        old_topic = conversations.active_slug(channel_id)
+        conversations.clear_active(channel_id)
+
     chat_histories[channel_id].append(user_message)
-    notebook.trim(chat_histories[channel_id])  # in one cut, not one message at a time, so what stays starts the same way each turn
+    dropped = notebook.trim(chat_histories[channel_id])  # in one cut, not one message at a time, so what stays starts the same way each turn
+    if dropped and notebook.cfg()['save_conversations']:
+        await asyncio.to_thread(conversations.stash, channel_id, dropped)  # set aside on disk first, so a crash or a failed summary loses nothing
     notebook.age_out(channel_id, chat_histories[channel_id], NOTES_TAG)
     related = await asyncio.to_thread(auto_history, message)  # if they talk as if she should remember something, the matching old messages
     await asyncio.to_thread(refresh_notes, channel_id, related)  # what she remembers about the people here, refreshed every message
@@ -2975,6 +3185,8 @@ async def handle_message(message):
                 all_tools.append(cancel_job_tool)  # only offered while there is something to stop
             if notebook.count(channel_id):
                 all_tools.append(notebook.look_back_tool)  # only offered once there is something in the notebook
+            if notebook.cfg()['save_conversations'] and conversations.any_visible(*conversation_scope()):
+                all_tools += [find_conversation_tool, open_conversation_tool]  # only once there is a saved conversation she may see
             if is_owner(user_id) and agent_view_available():
                 all_tools.append(look_at_agent_work_tool)  # the owner's chat only, and only once an agent has left something to look at
             
@@ -3043,31 +3255,16 @@ async def handle_message(message):
                     })
 
                 def _sync_blind_step(msgs):
-                    return ollama.chat(
-                        model=MODEL_NAME,
-                        messages=msgs,
-                        tools=all_tools,
-                        think=False,
-                        keep_alive=KEEP_ALIVE,
-                        options=ollama_options(temperature=0.1, num_predict=2048),
-                        stream=False
-                    )
+                    # streamed, so a long answer is never "no reply yet" to the clock: STEP_SECONDS is the one limit, and hitting it closes the request
+                    return chat_streamed(label='💬', max_seconds=STEP_SECONDS, model=MODEL_NAME, messages=msgs, tools=all_tools, think=False,
+                                         keep_alive=KEEP_ALIVE, options=ollama_options(temperature=0.1, num_predict=2048))
 
-                # 2048 tokens at about 65 tok/s is 31s, so a long written step needs more than 30s
-                print(f"⏳ Waiting for model response (90s timeout)...")
-                try:
-                    step_response = await asyncio.wait_for(
-                        asyncio.to_thread(_sync_blind_step, step_messages),
-                        timeout=90.0
-                    )
-                except asyncio.TimeoutError:
-                    print(f"⏱️ Step {step_num} timed out after 90 seconds!")
-                    await message.channel.send(f"⚠️ *Step {step_num} took too long to compute. Forcing continuation...*")
-                    continue
-
-
+                step_response = await asyncio.to_thread(_sync_blind_step, step_messages)
                 assistant_msg = step_response.message
-                chat_histories[channel_id].append(assistant_msg)
+                entry = {'role': 'assistant', 'content': assistant_msg.content or ''}
+                if assistant_msg.tool_calls:
+                    entry['tool_calls'] = assistant_msg.tool_calls
+                chat_histories[channel_id].append(entry)
 
                 # Stream/send any conversational text output
                 # two overlapping plan steps can produce the same text: send each distinct reply once
@@ -3075,6 +3272,9 @@ async def handle_message(message):
                 if said and said not in sent_replies:
                     sent_replies.add(said)
                     await send_long(message.channel, assistant_msg.content, addr, mentions=True)
+                if step_response.done_reason == 'timeout':
+                    print(f"⏱️ Step {step_num} was stopped after {STEP_SECONDS} seconds.")
+                    await message.channel.send(f"⚠️ *Step {step_num} was taking too long, so I stopped it there.*")
 
                 # Execute any tool calls requested for this step
                 looked = False
@@ -3088,7 +3288,7 @@ async def handle_message(message):
                         res = ""
                         res = await asyncio.to_thread(run_tool, tname, args)
 
-                        if tname in ('look_back', 'look_at_agent_work'):
+                        if tname in ('look_back', 'look_at_agent_work', 'find_conversation', 'open_conversation'):
                             looked = True  # her own reading, not for the chat: she answers from it below
                         else:
                             await send_long(message.channel, res)
@@ -3137,15 +3337,14 @@ async def handle_message(message):
                         chat_histories[channel_id].append({'role': 'tool', 'tool_name': tname, 'content': str(res)})
 
                     if looked:  # she read her notebook: now she answers with what she found
-                        try:
-                            follow = await asyncio.wait_for(asyncio.to_thread(
-                                ollama.chat, model=MODEL_NAME, messages=list(chat_histories[channel_id]), tools=[], think=False,
-                                keep_alive=KEEP_ALIVE, options=ollama_options(temperature=0.1, num_predict=2048), stream=False), timeout=90.0)
-                            chat_histories[channel_id].append(follow.message)
-                            if (follow.message.content or '').strip():
-                                await send_long(message.channel, follow.message.content, addr, mentions=True)
-                        except asyncio.TimeoutError:
-                            await message.channel.send("⚠️ *I read my notes but took too long to answer. Ask me again.*")
+                        follow = await asyncio.to_thread(
+                            chat_streamed, label='💬', max_seconds=STEP_SECONDS, model=MODEL_NAME, messages=list(chat_histories[channel_id]), tools=[],
+                            think=False, keep_alive=KEEP_ALIVE, options=ollama_options(temperature=0.1, num_predict=2048))
+                        chat_histories[channel_id].append({'role': 'assistant', 'content': follow.message.content or ''})
+                        if (follow.message.content or '').strip():
+                            await send_long(message.channel, follow.message.content, addr, mentions=True)
+                        if follow.done_reason == 'timeout':
+                            await message.channel.send("⚠️ *I read my notes but was taking too long to answer, so I stopped. Ask me again.*")
 
                 if handed_off:  # the job's result doesn't exist yet, so the steps after it can only make something up; it is posted when it finishes
                     break
@@ -3153,6 +3352,17 @@ async def handle_message(message):
             print("💬 [All Plan Steps Completed]\n")
             if shrunk:
                 user_message['content'] = shrunk
+            if notebook.cfg()['save_conversations'] and (dropped or old_topic):
+                try:  # after her answer, so filing (a couple of model calls) never delays it
+                    if old_topic:  # the chat has moved on: the older part, about the subject it left, is filed now and leaves the history
+                        hist = chat_histories[channel_id]
+                        i = next((j for j in range(len(hist) - 1, 0, -1) if hist[j] is user_message), 0)
+                        if len(conversations.lines(hist[1:i])) >= notebook.cfg()['leave_min_messages']:
+                            await asyncio.to_thread(conversations.stash, channel_id, hist[1:i])
+                            hist[1:i] = []
+                    await asyncio.to_thread(conversations.file_pending, channel_id, message.guild.id if message.guild else 0, not old_topic, old_topic)
+                except Exception as e:
+                    print(f"⚠️ couldn't save the conversation: {e}")
             keep_session(channel_id, user_id)  # the window counts from her last word, not from your message
             after_exchange(user_id, message.content, channel_id, message.channel)
         except Exception as e:
