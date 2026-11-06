@@ -1,5 +1,11 @@
 """The Images panel's python side: starts a picture (one at a time, while her language model is out of the GPU) and lists the gallery."""
 import asyncio
+import base64
+import os
+import shutil
+import tempfile
+
+import image_edit
 
 
 def setup(web_ui, env):
@@ -29,6 +35,35 @@ def setup(web_ui, env):
                 except Exception as e:
                     await web_ui.push("images", {"failed": str(e)})
             asyncio.create_task(run())
+            return {"started": True}
+        if action == "edit":
+            instruction = str(data.get("prompt", "")).strip()[:2000]
+            head, _, b64 = str(data.get("image", "")).partition(",")
+            if not instruction or not b64:
+                raise ValueError("choose a picture and say what to change")
+            if not image_edit.names():
+                raise RuntimeError("no editing model is installed")
+            raw = base64.b64decode(b64)
+            folder = tempfile.mkdtemp(prefix="sera-edit-")
+            src = os.path.join(folder, "ref" + (".png" if "png" in head else ".jpg"))
+            with open(src, "wb") as f:
+                f.write(raw)
+            loop = asyncio.get_running_loop()
+
+            def progress(text):
+                asyncio.run_coroutine_threadsafe(web_ui.push("images", {"progress": text}), loop)
+
+            async def run_edit():
+                try:
+                    async with env.model_lock:
+                        await web_ui.push("images", {"progress": "waiting for her to finish…"})
+                        result = await asyncio.to_thread(image_edit.edit, instruction, src, data.get("model") or None, data.get("steps") or None, data.get("seed"), progress)
+                    await web_ui.push("images", {"done": {"name": result["path"].replace("\\", "/").split("/")[-1], **result}})
+                except Exception as e:
+                    await web_ui.push("images", {"failed": str(e)})
+                finally:
+                    shutil.rmtree(folder, ignore_errors=True)
+            asyncio.create_task(run_edit())
             return {"started": True}
         raise ValueError(f"unknown action {action!r}")
 

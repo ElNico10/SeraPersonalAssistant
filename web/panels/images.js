@@ -14,7 +14,8 @@ export function mount(el, api) {
       .form textarea:focus, .form input:focus, .form select:focus { outline: 1px solid var(--accent); }
       .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
       #make { background: var(--accent); color: var(--bg); border: 0; padding: 9px; font: inherit; font-weight: bold; cursor: pointer; }
-      #make:disabled { opacity: .5; cursor: wait; }
+      #make:disabled, #emake:disabled { opacity: .5; cursor: wait; }
+      #emake { background: var(--accent); color: var(--bg); border: 0; padding: 9px; font: inherit; font-weight: bold; cursor: pointer; }
       #state { color: var(--dim); font-size: 12px; min-height: 18px; }
       #state.bad { color: var(--warn); }
       #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
@@ -35,6 +36,7 @@ export function mount(el, api) {
       .exrow button { background: none; border: 1px solid var(--accent); color: var(--accent); font: inherit; padding: 3px 10px; cursor: pointer; }
     </style>
     <div id="imgs">
+      <div style="display:grid;gap:16px">
       <div class="form">
         <label>Prompt (plain sentences work best: subject, setting, light, style)<textarea id="prompt" rows="6"></textarea></label>
         <label>Avoid<textarea id="neg" rows="2" placeholder="blank = the model's usual list"></textarea></label>
@@ -52,6 +54,18 @@ export function mount(el, api) {
         <button id="make">Generate</button>
         <div id="state"></div>
       </div>
+      <div class="form">
+        <b>Edit a picture (Klein)</b>
+        <label>Picture to change<input id="eimg" type="file" accept="image/*"></label>
+        <img id="eprev" style="max-width:100%;display:none" alt="">
+        <label>What to change (say it as an instruction)<textarea id="eprompt" rows="3" placeholder="e.g. add students walking to class, keep everything else"></textarea></label>
+        <div class="two">
+          <label>Steps<input id="esteps" type="number" min="1" max="12" value="4"></label>
+          <label>Seed (blank = random)<input id="eseed" type="number"></label>
+        </div>
+        <button id="emake">Edit</button>
+      </div>
+      </div>
       <div><div id="grid"></div><div id="empty"></div></div>
       <details class="ex"><summary>Examples: pictures with the prompts that made them (click to open)</summary><div id="exlist">loading…</div></details>
     </div>`;
@@ -62,7 +76,7 @@ export function mount(el, api) {
     const d = document.createElement("div");
     d.className = "pic";
     d.innerHTML = `<a href="/images/${encodeURIComponent(im.name)}" target="_blank"><img loading="lazy" src="/images/${encodeURIComponent(im.name)}" alt="${esc(im.prompt)}"></a>
-      <div class="meta"><button data-act="reuse">reuse</button>seed ${esc(im.seed)} · ${esc(im.width)}×${esc(im.height)}<br>${esc((im.prompt || "").slice(0, 120))}</div>`;
+      <div class="meta"><button data-act="reuse">reuse</button>seed ${esc(im.seed)}${im.width ? ` · ${esc(im.width)}×${esc(im.height)}` : ""}${im.edit_model ? " · edited" : ""}<br>${esc((im.prompt || "").slice(0, 120))}</div>`;
     d.querySelector('[data-act="reuse"]').onclick = () => {
       $("prompt").value = im.prompt || ""; $("neg").value = im.negative || ""; $("seed").value = im.seed ?? "";
       if (im.width && im.height) $("shape").value = `${im.width}x${im.height}`;
@@ -103,14 +117,41 @@ export function mount(el, api) {
                        steps: Number($("steps").value), guidance: Number($("cfg").value), seed: $("seed").value === "" ? null : Number($("seed").value) });
     } catch (e) { state.textContent = e.message; state.className = "bad"; make.disabled = false; }
   };
+  // the picture goes over the socket, so it is shrunk to fit first (the model works at about one megapixel anyway)
+  let eimage = "";
+  const shrink = (file) => new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, 1280 / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      for (const q of [0.92, 0.8, 0.65, 0.5]) { const u = c.toDataURL("image/jpeg", q); if (u.length < 900000) return resolve(u); }
+      reject(new Error("that picture is too big to send"));
+    };
+    img.onerror = () => reject(new Error("couldn't read that picture"));
+    img.src = URL.createObjectURL(file);
+  });
+  $("eimg").onchange = async () => {
+    const f = $("eimg").files[0]; eimage = "";
+    if (!f) return;
+    try { eimage = await shrink(f); $("eprev").src = eimage; $("eprev").style.display = "block"; state.textContent = ""; }
+    catch (e) { state.textContent = e.message; state.className = "bad"; }
+  };
+  $("emake").onclick = async () => {
+    $("emake").disabled = true; state.className = ""; state.textContent = "sending…";
+    try {
+      await api.call({ action: "edit", image: eimage, prompt: $("eprompt").value, steps: Number($("esteps").value) || null, seed: $("eseed").value === "" ? null : Number($("eseed").value) });
+    } catch (e) { state.textContent = e.message; state.className = "bad"; $("emake").disabled = false; }
+  };
   api.onEvent((ev) => {
     if (ev.type === "hello") load();
     if (ev.type === "image") load();  // she made one from the chat
     if (ev.type !== "panel" || ev.panel !== "images") return;
     const d = ev.data;
     if (d.progress) state.textContent = d.progress;
-    if (d.failed) { state.textContent = `couldn't make it: ${d.failed}`; state.className = "bad"; make.disabled = false; }
-    if (d.done) { state.textContent = `done in ${d.seconds}s (seed ${d.seed})`; make.disabled = false; load(); }
+    if (d.failed) { state.textContent = `couldn't make it: ${d.failed}`; state.className = "bad"; make.disabled = false; $("emake").disabled = false; }
+    if (d.done) { state.textContent = `done in ${d.seconds}s (seed ${d.seed})`; make.disabled = false; $("emake").disabled = false; load(); }
   });
   window.addEventListener("panel-shown", (e) => e.detail === "images" && load());
   load(); loadExamples();

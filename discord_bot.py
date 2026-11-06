@@ -2524,6 +2524,15 @@ async def handle_image_command(message):
     finally:
         image_waiting[0] -= 1
 
+EDIT_REQUEST = re.compile(r"\b(edit|retouch|photoshop|remove|get rid of|take (?:out|away)|erase|delete|add|put|insert|replace|swap|change|turn|make|fix|clean up|"
+                          r"brighten|darken|colou?r|recolou?r|blur|crop out)\b", re.I)
+
+def wants_image_edit(message):
+    """A picture is attached (to this message, or to the one it replies to) and the words ask for a change to it."""
+    ref = message.reference.resolved if message.reference and isinstance(message.reference.resolved, discord.Message) else None
+    pics = any((a.content_type or "").startswith("image/") for m in (message, ref) if m for a in m.attachments)
+    return pics and bool(EDIT_REQUEST.search(message.clean_content or ""))
+
 EDIT_HELP = ("`!image edit <what to change>` with a picture attached (or replying to a message that has one). "
              "Owner only: I check your words, not the picture itself.")
 
@@ -2669,7 +2678,7 @@ async def on_ready():
     print(f"==================================================\n")
     web_ui.init(SimpleNamespace(on_message=on_message, owner_id=lambda: int(os.environ.get('SERA_OWNER_ID') or 0),
                                 owner_name=lambda: nickname_of(int(os.environ.get('SERA_OWNER_ID') or 0), 'you'),
-                                state_dir=SECURE_BOT_DIRECTORY, status=web_status, images_dir=IMAGES_DIR, model_lock=MODEL_LOCK,
+                                state_dir=SECURE_BOT_DIRECTORY, status=web_status, images_dir=IMAGES_DIR, model_lock=MODEL_LOCK, agent_mode=agent_mode,
                                 examples_dir=image_gen.EXAMPLES_DIR, image_examples=image_gen.examples,
                                 image_ready=image_gen.available, image_list=image_gen.recent,
                                 image_generate=lambda data, progress: image_gen.generate(
@@ -2910,6 +2919,10 @@ async def on_message(message):
             and voice_chat.looks_like_voice_request(message.content)):
         if await voice_chat.handle_natural_request(message):  # "sera join vc", "leave the call"
             return
+    if (is_owner(uid) and not message.author.bot and not getattr(message, 'is_web', False) and image_gen.discord_on() and image_edit.names()
+            and (any(message_hint(message)) or message.guild is None) and wants_image_edit(message)):
+        await handle_image_edit(message, message.clean_content)  # "sera, remove the people from this picture": a picture attached means Klein, not the coding agent
+        return
     if (not message.author.bot and (any(message_hint(message)) or (message.guild is None and is_owner(uid)))
             and not await room_for_chat(message)):
         return  # her model can't load while the owner has the GPU; she has said so
