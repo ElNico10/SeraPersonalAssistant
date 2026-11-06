@@ -28,6 +28,7 @@ import reminders
 import web_ui
 import image_gen
 import image_edit
+import access
 import image_safety
 import vram_guard
 from dotenv import load_dotenv
@@ -2172,7 +2173,7 @@ def resolve_person(name):
 async def handle_mood_command(message):
     """Owner's view of her feelings, and the controls."""
     reply = lambda t: message.reply(t, mention_author=False)
-    if not is_owner(message.author.id):
+    if not access.allows('mood', message.author.id, is_owner(message.author.id)):
         return await reply(not_owner_line())
     parts = message.content.split()
     cmd = parts[1].lower() if len(parts) > 1 else "status"
@@ -2222,6 +2223,7 @@ def help_text(owner):
                 "or \"my reminders\". `!image examples` shows what the picture maker can do, if it's switched on. Everything else with a `!` is for my owner.")
     tiers = list(agent_cfg()['claude_models']) or ['model name']  # the tier names are whatever models.json says
     return ("**Commands** (all yours; `!help` shows this)\n"
+            "**Access:** `!allow` (who may use which command), `!allow add @person`, `!allow remove @person`, `!allow <command> owner|friends|everyone`\n"
             "**Restart:** `!update` (checks her code compiles, then restarts her with the current code)\n"
             "**Coding agent:** `!agent` (status), `!agent claude`, `!agent local`, `!agent model " + "|".join(tiers) + "|auto`, `!agent effort low|medium|high|xhigh|max|auto`, `!agent stop [job number]` (give up on a job: no retries, no report). "
             "You can also say it in a message: \"use " + tiers[0] + " on low effort\".\n"
@@ -2239,7 +2241,28 @@ def help_text(owner):
             "and the web page at the address in the console.")
 
 async def handle_help_command(message):
-    await message.reply(help_text(is_owner(message.author.id)), mention_author=False)
+    await send_long(message.channel, help_text(is_owner(message.author.id)))  # the owner's list is over Discord's 2000-character limit, so it goes out in pieces
+
+async def handle_allow_command(message):
+    """!allow: owner only. Who may use which command: a friends list, and a level (owner / friends / everyone) per command."""
+    reply = lambda t: message.reply(t, mention_author=False)
+    if not is_owner(message.author.id):
+        return await reply(not_owner_line())
+    parts = message.content.split()
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    who = message.mentions[0].id if message.mentions else (int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None)
+    if sub in ("add", "remove") and who:
+        (access.add_friend if sub == "add" else access.remove_friend)(who)
+        return await reply(f"{'Added' if sub == 'add' else 'Removed'} {nickname_of(who, str(who))} {'to' if sub == 'add' else 'from'} the friends list.")
+    if sub in access.COMMANDS and len(parts) > 2 and parts[2].lower() in access.LEVELS:
+        access.set_level(sub, parts[2].lower())
+        return await reply(f"`{sub}` is now: {parts[2].lower()}.")
+    if sub == "status":
+        names = ", ".join(nickname_of(f, str(f)) for f in sorted(access.friends())) or "nobody yet"
+        rows = "\n".join(f"`{c}`: **{access.level(c)}** ({d})" for c, d in access.COMMANDS.items())
+        return await reply(f"**Friends:** {names}\n{rows}\n`!allow add @person`, `!allow remove @person`, `!allow <command> owner|friends|everyone`. "
+                           "`!update`, `!allow` and the voice-call commands are always owner-only.")
+    await reply("`!allow` (status), `!allow add @person`, `!allow remove @person`, `!allow <command> owner|friends|everyone`")
 
 async def announce_restart():
     """After !update: say in the chat that asked for it that she is back. The note is deleted first, so a crash loop can't repeat it."""
@@ -2310,7 +2333,7 @@ def agent_status_text():
 async def handle_agent_command(message):
     """Owner's switch between the local coding agent and Claude. Anyone else is turned away."""
     reply = lambda t: message.reply(t, mention_author=False)
-    if not is_owner(message.author.id):
+    if not access.allows('agent', message.author.id, is_owner(message.author.id)):
         return await reply(not_owner_line())
     parts = message.content.lower().split()
     cmd = parts[1] if len(parts) > 1 else 'status'
@@ -2493,7 +2516,25 @@ async def post_picture(message, path, caption):
         await message.channel.send(caption)
         await message.channel.send_image(path)
     else:
-        await message.reply(caption, file=discord.File(path), mention_author=False)
+        send, note = path, ""
+        if os.path.getsize(path) > 8_000_000:  # Discord refuses big uploads: send a JPEG of it, the full file stays in the gallery
+            try:
+                import tempfile
+                from PIL import Image
+                im = Image.open(path).convert("RGB")
+                send = os.path.join(tempfile.mkdtemp(prefix="sera-send-"), "picture.jpg")
+                for q in (92, 85, 75, 60):
+                    im.save(send, quality=q)
+                    if os.path.getsize(send) < 8_000_000:
+                        break
+                note = f" (sent as a JPEG to fit Discord; the full-size PNG is saved as {os.path.basename(path)})"
+            except Exception:
+                send = path
+        try:
+            await message.reply(caption + note, file=discord.File(send), mention_author=False)
+        finally:
+            if send != path:
+                shutil.rmtree(os.path.dirname(send), ignore_errors=True)
 
 async def handle_image_command(message):
     """!image <prompt>: draw a picture in this chat. Off for Discord until the owner switches it on; owner only unless the config says otherwise."""
@@ -2518,10 +2559,12 @@ async def handle_image_command(message):
     if arg.lower() == 'examples':
         return await show_examples(message)
     settings = image_gen.cfg().get('discord', {})
-    if not owner and settings.get('owner_only', True):
-        return await reply(not_owner_line())
     if arg.lower().split()[:1] == ['edit']:
         return await handle_image_edit(message, arg[4:].strip())
+    if arg.lower().split()[:1] == ['upscale']:
+        return await handle_image_edit(message, None)  # attach a picture; "--scale n" in the message sets how much
+    if not access.allows('image', uid, owner):
+        return await reply(not_owner_line())
     if not image_gen.available():
         return await reply("The picture model isn't set up (models.json, see the README).")
     prompt, opts = parse_image_request(arg)
@@ -2552,6 +2595,10 @@ async def handle_image_command(message):
 EDIT_REQUEST = re.compile(r"\b(edit|retouch|photoshop|remove|get rid of|take (?:out|away)|erase|delete|add|put|insert|replace|swap|change|turn|make|fix|clean up|"
                           r"brighten|darken|colou?r|recolou?r|blur|crop out)\b", re.I)
 
+EDIT_SCALE = re.compile(r"(?:--scale[=\s]+(\d+(?:\.\d+)?)|\b(?:upscale|enlarge)\w*\s+(?:it\s+|this\s+)?(?:by\s+|to\s+)?(\d+(?:\.\d+)?)\s*x\b)", re.I)
+EDIT_SIZE = re.compile(r"(?:--mp[=\s]+(\d+(?:\.\d+)?)|\b(?:at\s+)?(\d+(?:\.\d+)?)\s*(?:mp|megapixels?)\b)", re.I)
+UPSCALE_REQUEST = re.compile(r"\b(upscal\w*|enlarg\w*|sharpen\w*|enhanc\w*|super[- ]?resolution|(?:higher|better|more)\s+(?:res\w*|quality)|increase the (?:resolution|size)|bigger|larger|sharper|clearer|crisper)\b", re.I)
+STRONG_EDIT = re.compile(r"\b(edit|retouch|photoshop|remove|get rid of|take (?:out|away)|erase|delete|add|insert|replace|swap|brighten|darken|colou?r|recolou?r|blur|crop out|clean up)\b", re.I)
 IMAGE_WORD = re.compile(r"\b(image|picture|photo|pic|screenshot|snip)s?\b", re.I)
 LOOKS_BACK = re.compile(r"\b(how i asked|as i asked|what i asked|how i said|as i said|like i said|like i asked|do it again)\b", re.I)
 CALLS_HER = re.compile(r"^\W*(?:sera|seraphim)\b[\s,:]*", re.I)
@@ -2564,35 +2611,55 @@ async def edit_source(message):
     replies to; failing that, if the words talk about "the image", the latest picture in the last 60 messages here. When the words only point
     back ("edit it how I asked"), the instruction is what was said with that picture."""
     text = message.clean_content or ""
-    if not EDIT_REQUEST.search(text):
+    only_enlarge = bool(UPSCALE_REQUEST.search(text)) and not STRONG_EDIT.search(UPSCALE_REQUEST.sub(" ", text))
+    if not only_enlarge and not EDIT_REQUEST.search(text):
         return None
     ref = message.reference.resolved if message.reference and isinstance(message.reference.resolved, discord.Message) else None
     att = _image_in(message) or _image_in(ref)
     if att:
-        return att, CALLS_HER.sub("", text)
+        return att, (None if only_enlarge else CALLS_HER.sub("", text))
     if not IMAGE_WORD.search(text):
         return None
     async for m in message.channel.history(limit=60, before=message):
         att = _image_in(m)
         if att:
             said = CALLS_HER.sub("", (m.clean_content or "").strip())
-            return att, (said if said and LOOKS_BACK.search(text) else CALLS_HER.sub("", text))
+            return att, (None if only_enlarge else (said if said and LOOKS_BACK.search(text) else CALLS_HER.sub("", text)))
     return None
 
-EDIT_HELP = ("`!image edit <what to change>` with a picture attached (or replying to a message that has one). "
-             "Owner only: I check your words, not the picture itself.")
+EDIT_HELP = ("`!image upscale` (just make a picture bigger and sharper, `--scale <n>`) or `!image edit <what to change> [--mp <size>]` with a picture attached (or replying to a message that has one); the size is in megapixels "
+             "(default 1; 0.05 is very chunky, 3 is the most). `--scale <n>` (or \"upscale it 4x\") makes the finished picture n times bigger and sharper, up to 4. "
+             "I check what you write, not the picture itself.")
 
 async def handle_image_edit(message, arg, att=None):
     reply = lambda t: message.reply(t, mention_author=False)
-    if not is_owner(message.author.id):
-        return await reply(not_owner_line())  # the reference picture isn't scanned, so only the owner may
+    uid, owner = message.author.id, is_owner(message.author.id)
+    if not access.allows('image_edit', uid, owner):
+        return await reply(not_owner_line())  # note: your words are checked, the attached picture is not
+    if not owner and not image_gen.discord_on():
+        return None
+    settings = image_gen.cfg().get('discord', {})
+    if not owner:
+        wait = settings.get('cooldown_seconds', 120) - (time.time() - image_last.get(uid, 0))
+        if wait > 0:
+            return await reply(f"Give it {wait:.0f} more seconds.")
+        if image_waiting[0] >= settings.get('max_waiting', 2):
+            return await reply(random.choice(BUSY_LINES))
     model = None
-    words = arg.split(None, 1)
-    if words and words[0].lower() in image_edit.GRAPHS:
+    words = (arg or "").split(None, 1)
+    if arg is not None and words and words[0].lower() in image_edit.GRAPHS:
         model, arg = words[0].lower(), (words[1] if len(words) > 1 else "")
+    size = EDIT_SIZE.search(arg or "")  # "--mp 2", "at 2 megapixels", "2mp": the size to edit at
+    if size:
+        arg = (arg[:size.start()] + arg[size.end():]).strip()
+    megapixels = float(size.group(1) or size.group(2)) if size else None
+    zoom = EDIT_SCALE.search(arg or message.clean_content or "")  # "--scale 2", "upscale it 4x": how many times bigger the finished picture is made
+    if zoom and arg:
+        arg = (arg[:zoom.start()] + arg[zoom.end():]).strip()
+    scale = float(zoom.group(1) or zoom.group(2)) if zoom else None
     if not image_edit.names():
         return await reply("No editing model is set up (see `edit` in image_gen_config.json).")
-    if not arg:
+    if arg is not None and not arg:
         return await reply(EDIT_HELP + " Ready: " + ", ".join(image_edit.names()) + ".")
     if att is None:
         ref = message.reference.resolved if message.reference and isinstance(message.reference.resolved, discord.Message) else None
@@ -2602,18 +2669,21 @@ async def handle_image_edit(message, arg, att=None):
     import tempfile
     src = os.path.join(tempfile.mkdtemp(prefix="sera-edit-"), "ref" + (os.path.splitext(att.filename)[1] or ".png"))
     await att.save(src)
+    image_waiting[0] += 1
+    image_last[uid] = time.time()
     try:
-        await reply("Editing it. This takes a minute or two, and I can't talk while I do.")
+        await reply(("Enlarging it" if arg is None else "Editing it") + ". This takes a minute or two, and I can't talk while I do.")
         async with MODEL_LOCK:
             async with message.channel.typing():
                 try:
-                    made = await asyncio.to_thread(image_edit.edit, arg[:2000], src, model)
+                    made = await asyncio.to_thread(image_edit.edit, None if arg is None else arg[:2000], src, model, None, None, None, megapixels, scale)
                 except image_safety.Refused as e:
                     return await reply(str(e))
                 except Exception as e:
                     return await reply(f"Couldn't edit it: {e}")
-        await post_picture(message, made['path'], f"{made['model']}, seed {made['seed']}, {made['seconds']:.0f}s, peak {made['peak_mb']} MiB")
+        await post_picture(message, made['path'], f"{made['model']}{' x' + str(made['scale']) if made['scale'] > 1 else ''}, {made['size']}, seed {made['seed']}, {made['seconds']:.0f}s, peak {made['peak_mb']} MiB")
     finally:
+        image_waiting[0] -= 1
         shutil.rmtree(os.path.dirname(src), ignore_errors=True)
 
 async def handle_history_command(message):
@@ -2629,7 +2699,7 @@ async def handle_history_command(message):
 async def handle_memory_command(message):
     """Owner's view of her long-term memory, and the controls."""
     reply = lambda t: message.reply(t, mention_author=False)
-    if not is_owner(message.author.id):
+    if not access.allows('memory', message.author.id, is_owner(message.author.id)):
         return await reply(not_owner_line())
     parts = message.content.split(None, 2)
     cmd = parts[1].lower() if len(parts) > 1 else "status"
@@ -2692,7 +2762,7 @@ async def _reminder_loop():
 async def handle_remind_command(message):
     """Owner's view of every pending reminder, and a way to cancel one."""
     reply = lambda t: message.reply(t, mention_author=False)
-    if not is_owner(message.author.id):
+    if not access.allows('remind', message.author.id, is_owner(message.author.id)):
         return await reply(not_owner_line())
     parts = message.content.split()
     cmd = parts[1].lower() if len(parts) > 1 else "status"
@@ -2795,7 +2865,7 @@ def cap_text(text):
     return text if len(text) <= MAX_ATTACHMENT_CHARS else text[:MAX_ATTACHMENT_CHARS] + "\n[... the rest of the file was cut ...]"
 
 OTHER_BOT_COMMAND = re.compile(r"[!/?.$%&~;=+\-][a-z]", re.I)  # "!play x", "/skip", ".help", "?rank", "-p song"
-HER_COMMANDS = re.compile(r"!(remind|memory|mood|vc|image|update)\b", re.I)
+HER_COMMANDS = re.compile(r"!(remind|memory|mood|vc|image|update|allow)\b", re.I)
 SPOKEN_TO_SOMEONE = re.compile(r"^\W*(?:(?:yo|hey|hi|hello|oi|ay|ok|okay)\W+)?([A-Za-z][\w'-]*)\s*[,:]")  # "Alex, join vc", "yo Mara: ..."
 
 def meant_for_someone_else(message):
@@ -2933,6 +3003,9 @@ async def on_message(message):
     uid = message.author.id
     if mood.is_ignored(uid):
         return  # she is ignoring this person right now; the owner can never be ignored
+    if re.match(r"!allow\b", message.content.strip().lower()):
+        await handle_allow_command(message)
+        return
     if re.match(r"!update\b", message.content.strip().lower()):
         await handle_update_command(message)  # works in DMs too, so it can be sent from a phone
         return
@@ -2967,11 +3040,11 @@ async def on_message(message):
             and voice_chat.looks_like_voice_request(message.content)):
         if await voice_chat.handle_natural_request(message):  # "sera join vc", "leave the call"
             return
-    if (is_owner(uid) and not message.author.bot and not getattr(message, 'is_web', False) and image_gen.discord_on() and image_edit.names()
-            and (any(message_hint(message)) or message.guild is None)):
+    if (access.allows('image_edit', uid, is_owner(uid)) and not message.author.bot and not getattr(message, 'is_web', False) and image_gen.discord_on() and image_edit.names()
+            and (any(message_hint(message)) or (message.guild is None and is_owner(uid)))):
         found = await edit_source(message)  # "sera, remove the people from this picture" / "...from that image I sent earlier": Klein, not the coding agent
         if found:
-            await handle_image_edit(message, found[1], found[0])
+            await handle_image_edit(message, found[1], found[0])  # found[1] is None when she is only to enlarge it
             return
     if (not message.author.bot and (any(message_hint(message)) or (message.guild is None and is_owner(uid)))
             and not await room_for_chat(message)):

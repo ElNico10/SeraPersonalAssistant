@@ -18,9 +18,8 @@
   "flow_shift": 1.0,
   "suffix": "anatomically correct. highest quality. detailed. sharp focus.",
   "discord": {
-    "_help": "Pictures from Discord chats: !image <prompt>. Off until you switch it on (or send !image on). owner_only: only the owner may. When others may, each person waits cooldown_seconds between pictures and at most max_waiting are queued.",
+    "_help": "Pictures from Discord chats: !image <prompt>. Off until you switch it on (or send !image on). Who may draw or edit is set in access_config.json (or with !allow). Each non-owner waits cooldown_seconds between pictures and at most max_waiting are queued.",
     "enabled": true,
-    "owner_only": true,
     "cooldown_seconds": 120,
     "max_waiting": 2
   },
@@ -31,13 +30,13 @@
     "categories": {
       "real_person": true,
       "nonconsensual": true,
-      "gore": false
+      "gore": true
     },
     "avoid": "",
     "block_nudity": true
   },
   "edit": {
-    "_help": "Editing a picture from an instruction (!image edit). ceiling_mb: the edit is stopped if the card's used memory passes it (the card has 12288 MiB). default: which model when none is named. (Qwen-Image-Edit was tried and removed: Q4 made anatomy errors.)",
+    "_help": "Editing a picture from an instruction (!image edit). ceiling_mb: the edit is stopped if the card's used memory passes it (the card has 12288 MiB). default: which model when none is named. (Qwen-Image-Edit was tried and removed: Q4 made anatomy errors.) megapixels (per model): the size edits are made at by default. min_megapixels / max_megapixels: the range a request may ask for (bigger = sharper but slower and more graphics memory; the ceiling_mb check still applies). enlarge_small: a result whose long side is under 1024 pixels (a small megapixels size) is enlarged with hard pixel edges, so chunky pixel art stays crisp instead of blurry.",
     "default": "klein",
     "ceiling_mb": 11800,
     "models": {
@@ -63,6 +62,26 @@
             "flux2-vae.safetensors"
           ]
         ]
+      }
+    },
+    "min_megapixels": 0.05,
+    "max_megapixels": 3.0,
+    "enlarge_small": true,
+    "upscale": {
+      "_help": "The upscaling step after an edit, or when a picture is only to be enlarged. backend: 'seedvr2' (a diffusion transformer that looks at the whole picture; default) or 'swinir' (a faster, sharper-but-more-invented GAN model, the file named in 'model'). scale 1 = off. native_scale and 'model' are for swinir only. max_scale and max_output_megapixels cap what a request can ask for. default_scale is used when an edit names none; upscale_only_scale when a picture is only enlarged. color_correction (seedvr2): lab, wavelet, adain or none.",
+      "enabled": true,
+      "model": "003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth",
+      "native_scale": 4,
+      "default_scale": 2,
+      "max_scale": 4,
+      "max_output_megapixels": 24,
+      "upscale_only_scale": 2,
+      "backend": "seedvr2",
+      "seedvr2": {
+        "unet": "seedvr2_3b_fp8_e4m3fn.safetensors",
+        "vae": "seedvr2_ema_vae_fp16.safetensors",
+        "tile_size": 512,
+        "color_correction": "lab"
       }
     }
   }

@@ -11,7 +11,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FILES = ["image_gen_config.json", "vram_guard_config.json", "efficiency_config.json", "memory_config.json", "mood_config.json", "reminders_config.json",
+FILES = ["access_config.json", "image_gen_config.json", "vram_guard_config.json", "efficiency_config.json", "memory_config.json", "mood_config.json", "reminders_config.json",
          "message_log_config.json", "agent_config.json", "music_config.json", "voice_config.json"]
 
 

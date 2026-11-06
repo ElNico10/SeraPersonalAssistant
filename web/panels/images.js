@@ -63,6 +63,8 @@ export function mount(el, api) {
           <label>Steps<input id="esteps" type="number" min="1" max="12" value="4"></label>
           <label>Seed (blank = random)<input id="eseed" type="number"></label>
         </div>
+        <label>Size in megapixels (blank = 1; 0.05 is very chunky, 3 is the most)<input id="emp" type="number" min="0.05" max="3" step="0.05"></label>
+        <label>Make the result bigger and sharper, times (blank = off, up to 4)<input id="escale" type="number" min="1" max="4" step="0.5"></label>
         <button id="emake">Edit</button>
       </div>
       </div>
@@ -141,7 +143,7 @@ export function mount(el, api) {
   $("emake").onclick = async () => {
     $("emake").disabled = true; state.className = ""; state.textContent = "sending…";
     try {
-      await api.call({ action: "edit", image: eimage, prompt: $("eprompt").value, steps: Number($("esteps").value) || null, seed: $("eseed").value === "" ? null : Number($("eseed").value) });
+      await api.call({ action: "edit", image: eimage, prompt: $("eprompt").value, steps: Number($("esteps").value) || null, seed: $("eseed").value === "" ? null : Number($("eseed").value), megapixels: $("emp").value === "" ? null : Number($("emp").value), scale: $("escale").value === "" ? null : Number($("escale").value) });
     } catch (e) { state.textContent = e.message; state.className = "bad"; $("emake").disabled = false; }
   };
   api.onEvent((ev) => {

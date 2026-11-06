@@ -1,0 +1,14 @@
+{
+  "_help": "Who may use which command. friends: Discord user ids (add people with !allow add @person). commands: owner, friends or everyone for each command. The owner can always do everything.",
+  "friends": [
+    608031380944715796
+  ],
+  "commands": {
+    "image": "friends",
+    "image_edit": "friends",
+    "memory": "owner",
+    "mood": "owner",
+    "agent": "owner",
+    "remind": "owner"
+  }
+}

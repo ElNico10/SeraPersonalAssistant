@@ -25,11 +25,12 @@ DEFAULTS = {
         "picture": 9500,         # the picture model at its peak while drawing
         "picture_idle": 5500,    # what the picture model keeps while it sits idle before it stops itself
         "coding": 9610,          # the local coding model (the rest of it sits in system RAM)
+        "edit_upscale": 7500,    # enlarging a picture with no edit
         "edit_klein": 8900,      # the picture-editing model at its peak (see image_edit.py)
     },
     "labels": {                  # how each feature is named in what she says
         "chat": "chatting", "voice": "a voice call", "picture": "pictures", "coding": "the coding agent",
-        "edit_klein": "picture editing",
+        "edit_klein": "picture editing", "edit_upscale": "picture enlarging",
     },
 }
 

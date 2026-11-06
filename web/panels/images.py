@@ -57,7 +57,7 @@ def setup(web_ui, env):
                 try:
                     async with env.model_lock:
                         await web_ui.push("images", {"progress": "waiting for her to finish…"})
-                        result = await asyncio.to_thread(image_edit.edit, instruction, src, data.get("model") or None, data.get("steps") or None, data.get("seed"), progress)
+                        result = await asyncio.to_thread(image_edit.edit, instruction, src, data.get("model") or None, data.get("steps") or None, data.get("seed"), progress, data.get("megapixels") or None, data.get("scale") or None)
                     await web_ui.push("images", {"done": {"name": result["path"].replace("\\", "/").split("/")[-1], **result}})
                 except Exception as e:
                     await web_ui.push("images", {"failed": str(e)})
