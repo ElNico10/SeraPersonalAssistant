@@ -2241,6 +2241,25 @@ def help_text(owner):
 async def handle_help_command(message):
     await message.reply(help_text(is_owner(message.author.id)), mention_author=False)
 
+async def announce_restart():
+    """After !update: say in the chat that asked for it that she is back. The note is deleted first, so a crash loop can't repeat it."""
+    path = os.path.join(SECURE_BOT_DIRECTORY, 'restart_pending.json')
+    try:
+        with open(path, encoding='utf-8') as f:
+            note = json.load(f)
+        os.remove(path)
+    except (OSError, ValueError):
+        return
+    text = f"✅ Updated. I'm back online (the restart took about {max(1, round(time.time() - note.get('at', time.time())))} s)."
+    try:
+        if note.get('web'):
+            await web_ui.CHANNEL.send(text)
+        else:
+            channel = client.get_channel(note['channel_id']) or await client.fetch_channel(note['channel_id'])
+            await channel.send(text)
+    except Exception as e:
+        print(f"⚠️ couldn't say the update finished: {e}")
+
 # Waits for the old process to be gone (so the Discord login, web port and GPU are free), then starts the bot again in its own console.
 # argv: old pid, then the command to run. It inherits the bot's folder.
 RESTART_HELPER = ("import ctypes,subprocess,sys;k=ctypes.windll.kernel32;h=k.OpenProcess(0x100000,0,int(sys.argv[1]));"
@@ -2252,13 +2271,19 @@ async def handle_update_command(message):
     if not is_owner(message.author.id):
         return await message.reply("Only my owner can restart me.", mention_author=False)
     here = os.path.dirname(os.path.abspath(__file__))
-    import py_compile
-    for f in sorted(Path(here).glob('*.py')):
+    await message.reply("🔄 Update started: checking her code first…", mention_author=False)
+    for f in sorted(Path(here).glob('*.py')) + sorted(Path(here, 'web', 'panels').glob('*.py')):
         try:
-            py_compile.compile(str(f), cfile=os.devnull, doraise=True)
-        except py_compile.PyCompileError as e:
+            with open(f, encoding='utf-8') as src:
+                compile(src.read(), str(f), 'exec')  # nothing is written; a syntax error is all this catches
+        except Exception as e:  # SyntaxError, or a file that can't be read: either way she would come back dead
             return await message.reply(f"❌ Not restarting: `{f.name}` doesn't compile, so I'd come back dead.\n```{str(e)[-1200:]}```", mention_author=False)
-    await message.reply("🔄 Restarting with the current code. Back in about a minute.", mention_author=False)
+    try:  # the new process says it is back, in this same chat
+        with open(os.path.join(SECURE_BOT_DIRECTORY, 'restart_pending.json'), 'w', encoding='utf-8') as pf:
+            json.dump({'channel_id': message.channel.id, 'web': bool(getattr(message, 'is_web', False)), 'at': time.time()}, pf)
+    except OSError:
+        pass
+    await message.reply("✅ Code checks out. Restarting now; I'll say here when I'm back (about a minute).", mention_author=False)
     subprocess.Popen([sys.executable, '-c', RESTART_HELPER, str(os.getpid()), sys.executable, *sys.argv], cwd=here, creationflags=0x00000010)
     try:
         await asyncio.wait_for(client.close(), 5)
@@ -2527,16 +2552,37 @@ async def handle_image_command(message):
 EDIT_REQUEST = re.compile(r"\b(edit|retouch|photoshop|remove|get rid of|take (?:out|away)|erase|delete|add|put|insert|replace|swap|change|turn|make|fix|clean up|"
                           r"brighten|darken|colou?r|recolou?r|blur|crop out)\b", re.I)
 
-def wants_image_edit(message):
-    """A picture is attached (to this message, or to the one it replies to) and the words ask for a change to it."""
+IMAGE_WORD = re.compile(r"\b(image|picture|photo|pic|screenshot|snip)s?\b", re.I)
+LOOKS_BACK = re.compile(r"\b(how i asked|as i asked|what i asked|how i said|as i said|like i said|like i asked|do it again)\b", re.I)
+CALLS_HER = re.compile(r"^\W*(?:sera|seraphim)\b[\s,:]*", re.I)
+
+def _image_in(m):
+    return next((a for a in m.attachments if (a.content_type or "").startswith("image/")), None) if m else None
+
+async def edit_source(message):
+    """(picture, instruction) when the owner is asking for a picture to be changed, else None. The picture is on this message or the one it
+    replies to; failing that, if the words talk about "the image", the latest picture in the last 60 messages here. When the words only point
+    back ("edit it how I asked"), the instruction is what was said with that picture."""
+    text = message.clean_content or ""
+    if not EDIT_REQUEST.search(text):
+        return None
     ref = message.reference.resolved if message.reference and isinstance(message.reference.resolved, discord.Message) else None
-    pics = any((a.content_type or "").startswith("image/") for m in (message, ref) if m for a in m.attachments)
-    return pics and bool(EDIT_REQUEST.search(message.clean_content or ""))
+    att = _image_in(message) or _image_in(ref)
+    if att:
+        return att, CALLS_HER.sub("", text)
+    if not IMAGE_WORD.search(text):
+        return None
+    async for m in message.channel.history(limit=60, before=message):
+        att = _image_in(m)
+        if att:
+            said = CALLS_HER.sub("", (m.clean_content or "").strip())
+            return att, (said if said and LOOKS_BACK.search(text) else CALLS_HER.sub("", text))
+    return None
 
 EDIT_HELP = ("`!image edit <what to change>` with a picture attached (or replying to a message that has one). "
              "Owner only: I check your words, not the picture itself.")
 
-async def handle_image_edit(message, arg):
+async def handle_image_edit(message, arg, att=None):
     reply = lambda t: message.reply(t, mention_author=False)
     if not is_owner(message.author.id):
         return await reply(not_owner_line())  # the reference picture isn't scanned, so only the owner may
@@ -2548,8 +2594,9 @@ async def handle_image_edit(message, arg):
         return await reply("No editing model is set up (see `edit` in image_gen_config.json).")
     if not arg:
         return await reply(EDIT_HELP + " Ready: " + ", ".join(image_edit.names()) + ".")
-    ref = message.reference.resolved if message.reference and isinstance(message.reference.resolved, discord.Message) else None
-    att = next((a for m in (message, ref) if m for a in m.attachments if (a.content_type or "").startswith("image/")), None)
+    if att is None:
+        ref = message.reference.resolved if message.reference and isinstance(message.reference.resolved, discord.Message) else None
+        att = _image_in(message) or _image_in(ref)
     if att is None or att.size > 15_000_000:
         return await reply("Attach the picture to edit (under 15 MB), or reply to a message that has one. " + EDIT_HELP)
     import tempfile
@@ -2719,6 +2766,7 @@ async def on_ready():
     global _reminder_task
     if _reminder_task is None:
         _reminder_task = asyncio.create_task(_reminder_loop())
+    await announce_restart()
 
 
 QUEUE_LIMIT, PER_USER_QUEUE = 4, 2  # requests she holds at once (one running), and from one person
@@ -2920,9 +2968,11 @@ async def on_message(message):
         if await voice_chat.handle_natural_request(message):  # "sera join vc", "leave the call"
             return
     if (is_owner(uid) and not message.author.bot and not getattr(message, 'is_web', False) and image_gen.discord_on() and image_edit.names()
-            and (any(message_hint(message)) or message.guild is None) and wants_image_edit(message)):
-        await handle_image_edit(message, message.clean_content)  # "sera, remove the people from this picture": a picture attached means Klein, not the coding agent
-        return
+            and (any(message_hint(message)) or message.guild is None)):
+        found = await edit_source(message)  # "sera, remove the people from this picture" / "...from that image I sent earlier": Klein, not the coding agent
+        if found:
+            await handle_image_edit(message, found[1], found[0])
+            return
     if (not message.author.bot and (any(message_hint(message)) or (message.guild is None and is_owner(uid)))
             and not await room_for_chat(message)):
         return  # her model can't load while the owner has the GPU; she has said so
